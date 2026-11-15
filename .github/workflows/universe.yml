@@ -1,0 +1,38 @@
+# Refreshes data/universe.csv (the Technology and Biotech company list) every Sunday.
+# Run it any time: Actions tab > "Refresh company list" > Run workflow.
+name: Refresh company list
+
+on:
+  schedule:
+    - cron: "23 6 * * 0"      # Sundays 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write              # lets the job save the new list back to the repository
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Build the company list from the SEC
+        env:
+          SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+        run: |
+          if [ -z "$SEC_CONTACT_EMAIL" ]; then
+            echo "::error::Add a repository secret named SEC_CONTACT_EMAIL (README, step 4)."
+            exit 1
+          fi
+          python3 build_universe.py
+      - name: Save the list
+        run: |
+          git config user.name "company-list-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/universe.csv
+          git diff --cached --quiet || git commit -m "Refresh Technology and Biotech company list"
+          git push
