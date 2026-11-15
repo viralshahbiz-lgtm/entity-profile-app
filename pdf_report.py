@@ -97,83 +97,94 @@ def market_block(p):
 
 
 def build_story(p, lim):
-    c, r = p["company"], p["regm"]
+    c, r, ids, lst = p["company"], p["regm"], p["identifiers"], p["listing"]
     tickers = ", ".join(f"{s['ticker']} ({s['exchange']})" for s in p["securities"] if s["type"] == "Common Stock") or "n/a"
     story = [
         Paragraph(escape(c["name"]), S["title"]),
-        Paragraph(escape(f"{tickers}  ·  {c['sector']} · {c['industry']}  ·  CIK {c['cik']}  ·  "
+        Paragraph(escape(f"{tickers}  ·  {c['sector']} · {c['industry']}  ·  "
                          f"HQ {', '.join(x for x in (c['hq_city'], c['hq_country']) if x)}  ·  "
                          f"Incorporated {c['incorporation']}  ·  {c['filer_category'] or 'filer status n/a'}"), S["sub"]),
         Paragraph(escape(f"Entity profile summary as of {p['as_of']} · public sources: {', '.join(p['sources'])}"), S["sub"]),
-        Spacer(1, 5),
+        Spacer(1, 4),
         Paragraph("MARKET DATA", S["h"]), market_block(p),
-        Paragraph("BUSINESS DESCRIPTION", S["h"]),
-        Paragraph(escape((p["description"] or "Not available.")[:lim["desc"]]) +
-                  (f" <font color='#5d6878'>[{escape(p['description_source'])}]</font>" if p["description_source"] else ""),
-                  S["body"]),
     ]
-    secs = p["securities"][: lim["secs"]]
-    rows = [[P("Ticker", "cellb"), P("Security", "cellb"), P("Type", "cellb"), P("Exchange", "cellb")]] + \
-           [[P(s["ticker"]), P(s["name"]), P(s["type"]), P(s["exchange"])] for s in secs]
-    hold = p["holders"][: lim["holders"]]
-    hrows = [[P("Holder", "cellb"), P("%", "cellb"), P("Filed", "cellb")]] + \
-            [[P(h["name"]), P(f"{h['pct']:.1f}" if h["pct"] is not None else "n/a"), P(h["date"])] for h in hold]
-    if len(hrows) == 1:
-        hrows.append([P("No Schedule 13D/13G filings in 3 years", "cellm"), "", ""])
-    side = Table([[
-        [Paragraph(f"EQUITY SECURITIES ({len(p['securities'])})", S["h"]), grid(rows, [0.75 * inch, 1.95 * inch, 0.8 * inch, 0.7 * inch])],
-        [Paragraph("SIGNIFICANT HOLDERS (5%+)", S["h"]), grid(hrows, [2.0 * inch, 0.45 * inch, 0.75 * inch])],
-    ]], colWidths=[4.35 * inch, W - 4.35 * inch])
-    side.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                              ("RIGHTPADDING", (0, 0), (0, 0), 10)]))
-    story += [side]
+    d = p["description"]
+    story += [Paragraph("BUSINESS DESCRIPTION", S["h"]),
+              Paragraph(escape(_trim(d["text"] or "Not available.", lim["desc"])) +
+                        (f" <font color='#5d6878'>[{escape(d['source'])}]</font>" if d["source"] else ""), S["body"])]
 
-    # Reg M and safe harbors
-    story.append(Paragraph("REGULATION M AND RESEARCH SAFE HARBORS (PRELIMINARY SCREEN)", S["h"]))
-    story.append(Paragraph(escape(r["summary"]), S["body"]))
-    story.append(Spacer(1, 3))
-    inp = r["inputs"]
-    irows = []
-    for i in range(0, len(inp), 2):
-        pair = inp[i:i + 2]
-        row = []
-        for lab, val, srcn in pair:
-            row += [P(lab, "cellm"), P(val, "cellb"), P(srcn, "cellm")]
-        irows.append(row + [""] * (6 - len(row)))
-    story.append(grid(irows, [1.25 * inch, 0.8 * inch, 1.7 * inch] * 2, header=False))
-    trows = [[P("Rule", "cellb"), P("Applies to", "cellb"), P("Test", "cellb"), P("Result", "cellb")]]
-    for t in r["tests"]:
-        trows.append([P(t["rule"], "cellb"), P(t["who"]), P(t["test"], "cellm"),
-                      Paragraph(f"<font color='{STATUS[t['status']].hexval()}'><b>{escape(t['result'])}</b></font>"
-                                + (f"<br/><font color='#5d6878'>{escape(t['detail'])}</font>" if t["detail"] else ""), S["cell"])])
-    story += [Spacer(1, 4), grid(trows, [1.05 * inch, 1.6 * inch, 2.35 * inch, W - 5.0 * inch])]
-    hrows2 = [[P("Safe harbor", "cellb"), P("Status", "cellb"), P("Basis", "cellb"), P("Firm checks", "cellb")]]
-    for h in r["harbors"]:
-        hrows2.append([P(h["name"], "cellb"), P(h["status"], "cellb"), P(h["basis"], "cellm"), P(h["firm_checks"], "cellm")])
-    story += [Spacer(1, 4), grid(hrows2, [1.55 * inch, 1.05 * inch, 2.65 * inch, W - 5.25 * inch])]
+    # How and when it went public
+    ipo_txt = f"<b>{escape(lst['method'])}</b>" + (f" · <b>{escape(lst['date'])}</b>" if lst["date"] else "")
+    ev = "; ".join(f"{f} {dt}" for f, dt, _ in lst["evidence"][:4])
+    if ev:
+        ipo_txt += f" <font color='#5d6878'>(EDGAR: {escape(ev)})</font>"
+    story += [Paragraph("HOW AND WHEN IT WENT PUBLIC", S["h"]), Paragraph(ipo_txt, S["body"])]
+    if lst.get("web") and lim["ipo"]:
+        story.append(Paragraph(escape(_trim(lst["web"]["text"], lim["ipo"])) +
+                               " <font color='#5d6878'>[web search summary]</font>", S["body"]))
+
+    # Identifiers
+    e = ids["entity"]
+    story.append(Paragraph("SECURITY IDENTIFIERS", S["h"]))
+    story.append(Paragraph(escape(f"CIK {e['CIK']} · LEI {e['LEI'] or 'not found'}"
+                                  + (f" · EIN {e['EIN']}" if e.get('EIN') else "")
+                                  + (f" · {len(ids['debt'])} debt/other ISINs mapped to the issuer" if ids["debt"] else "")
+                                  + " · SEDOL: licensed, not in free sources"), S["cellm"]))
+    rows = [[P(h, "cellb") for h in ("Ticker", "Exchange", "Type", "ISIN", "CUSIP", "Composite FIGI")]]
+    for x in ids["securities"][: lim["ids"]]:
+        rows.append([P(x["ticker"]), P(x["exchange"]), P(x["type"]), P(x["isin"] or "n/a"), P(x["cusip"] or "n/a"),
+                     P(x["composite_figi"] or "n/a")])
+    story += [Spacer(1, 2), grid(rows, [0.8 * inch, 0.95 * inch, 1.35 * inch, 1.3 * inch, 1.05 * inch, W - 5.45 * inch])]
+
+    # Holders
+    hold = p["holders"][: lim["holders"]]
+    hrows = [[P("Holder", "cellb"), P("% of class", "cellb"), P("Form", "cellb"), P("Filed", "cellb")]] + \
+            [[P(h["name"]), P(f"{h['pct']:.1f}%" if h["pct"] is not None else "n/a"), P(h["form"]), P(h["date"])] for h in hold]
+    if len(hrows) == 1:
+        hrows.append([P("No Schedule 13D/13G filings in 3 years", "cellm"), "", "", ""])
+    story += [Paragraph(f"SIGNIFICANT HOLDERS (5%+; {len(hold)} OF {len(p['holders'])})", S["h"]),
+              grid(hrows, [W - 2.6 * inch, 0.8 * inch, 0.9 * inch, 0.9 * inch])]
 
     # Events and news
-    ev = p["events"]
-    up = sorted([e for e in ev if e["status"] != "Filed"], key=lambda e: e["date"])
-    past = [e for e in ev if e["status"] == "Filed"]
-    show = (up + past)[: lim["events"]]
-    erows = [[P("Date", "cellb"), P("Category", "cellb"), P("Event", "cellb"), P("Status", "cellb")]] + \
-            [[P(e["date"]), P(e["category"]), P(e["title"]), P(e["status"])] for e in show]
+    evs = p["events"]
+    up = sorted([x for x in evs if x["status"] == "Estimated"], key=lambda x: x["date"])
+    rest = [x for x in evs if x["status"] != "Estimated"]
+    show = (up[:2] + rest)[: lim["events"]]
+    erows = [[P(h, "cellb") for h in ("Date", "Category", "Event", "Source")]] + \
+            [[P(x["date"]), P(x["category"]), P(_trim(x["title"], 140)), P(x["form"] if x["status"] != "Estimated" else "Estimated")]
+             for x in show]
     if len(erows) == 1:
-        erows.append([P("No control-room-relevant filings in the last 180 days.", "cellm"), "", "", ""])
-    story += [KeepTogether([Paragraph(f"CORPORATE EVENTS (LAST 180 DAYS AND ESTIMATED UPCOMING; {len(show)} OF {len(ev)})", S["h"]),
-                            grid(erows, [0.75 * inch, 1.3 * inch, W - 2.75 * inch, 0.7 * inch])])]
+        erows.append([P("No events found in the last 90 days.", "cellm"), "", "", ""])
+    story += [KeepTogether([Paragraph(f"CORPORATE EVENTS (LAST 90 DAYS; {len(show)} OF {len(evs)})", S["h"]),
+                            grid(erows, [0.75 * inch, 1.35 * inch, W - 3.3 * inch, 1.2 * inch])])]
     news = p["news"][: lim["news"]]
     if news:
         nrows = [[P("Date", "cellb"), P("Headline", "cellb"), P("Source", "cellb")]] + \
-                [[P(n["date"]), P(n["headline"]), P(n["source"])] for n in news]
-        story += [KeepTogether([Paragraph(f"NEWS (LAST 180 DAYS; {len(news)} OF {len(p['news'])})", S["h"]),
-                                grid(nrows, [0.75 * inch, W - 1.85 * inch, 1.1 * inch])])]
+                [[P(n["date"]), P(_trim(n["title"], 150)), P(n["source"])] for n in news]
+        story += [KeepTogether([Paragraph(f"NEWS (LAST 90 DAYS; {len(news)} OF {len(p['news'])})", S["h"]),
+                                grid(nrows, [0.75 * inch, W - 2.05 * inch, 1.3 * inch])])]
+
+    # Safe harbor summary
+    frows = [[P(lab, "cellm") for lab, _ in r["facts"]], [P(v, "cellb") for _, v in r["facts"]]]
+    hrows2 = [[P("Safe harbor", "cellb"), P("Status", "cellb"), P("Basis", "cellb")]] + \
+             [[P(n, "cellb"), P(st, "cellb"), P(b, "cellm")] for n, st, b in r["harbors"]]
+    story += [KeepTogether([Paragraph("RESEARCH SAFE HARBOR SUMMARY", S["h"]), Paragraph(escape(r["summary"]), S["body"]),
+                            Spacer(1, 3), grid(frows, [W / len(r["facts"])] * len(r["facts"]), header=False), Spacer(1, 3),
+                            grid(hrows2, [2.1 * inch, 1.9 * inch, W - 4.0 * inch])])]
     story += [Spacer(1, 6), Paragraph(escape(
-        "Public data only: SEC EDGAR filings and XBRL, exchange symbol files, and the market data and news providers listed above. "
-        "Estimated dates are worked out from filing history. The Reg M and safe harbor section is an automated preliminary "
-        "screen, not legal advice; confirm every determination with Legal and Compliance. " + " ".join(r["caveats"][1:])), S["foot"])]
+        "Public data only: SEC EDGAR, GLEIF, OpenFIGI, exchange symbol files, web search and the market data provider named above. "
+        "Web summaries are machine-generated from search results and should be checked against the linked sources. "
+        "CUSIPs are owned by CUSIP Global Services; SEDOLs are licensed by LSEG. The safe harbor summary is a preliminary "
+        "screen, not legal advice."), S["foot"])]
     return story
+
+
+def _trim(text, n):
+    text = " ".join((text or "").split())
+    if len(text) <= n:
+        return text
+    cut = text[:n]
+    return (cut.rsplit(". ", 1)[0] + ".") if ". " in cut[n // 2:] else cut.rsplit(" ", 1)[0] + "…"
 
 
 def _footer(canvas, doc):
@@ -186,11 +197,11 @@ def _footer(canvas, doc):
 
 
 def make_pdf(p):
-    limits = [dict(desc=900, secs=10, holders=8, events=14, news=8),
-              dict(desc=700, secs=8, holders=6, events=10, news=6),
-              dict(desc=550, secs=6, holders=5, events=7, news=4),
-              dict(desc=400, secs=5, holders=4, events=5, news=3),
-              dict(desc=300, secs=4, holders=3, events=4, news=0)]
+    limits = [dict(desc=900, ipo=500, ids=10, holders=6, events=14, news=10),
+              dict(desc=700, ipo=380, ids=8, holders=5, events=10, news=7),
+              dict(desc=550, ipo=280, ids=6, holders=4, events=8, news=5),
+              dict(desc=420, ipo=200, ids=5, holders=3, events=6, news=3),
+              dict(desc=300, ipo=0, ids=4, holders=3, events=4, news=0)]
     pdf = None
     for lim in limits:
         buf = io.BytesIO()

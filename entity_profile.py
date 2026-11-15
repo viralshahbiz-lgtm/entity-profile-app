@@ -2,7 +2,9 @@
 Builds one company's profile from public sources.
 
 build_profile() returns a dict with these sections:
-  company, market, description, securities, holders, events, news, regm, warnings, sources
+  company, market, description, listing (how and when it went public), identifiers,
+  securities, holders, events (90 days), news (90 days), regm (safe harbor summary),
+  warnings, sources
 """
 import html
 import json
@@ -15,7 +17,7 @@ import sources as src
 from sectors import sector_for_sic, country_for_code
 import regm
 
-EVENT_DAYS = 180
+EVENT_DAYS = 90
 HOLDER_YEARS = 3
 PERIODIC = ("10-K", "10-Q", "20-F", "40-F")
 ANNUAL = ("10-K", "20-F", "40-F")
@@ -32,7 +34,32 @@ WHY = {
     "Earnings / reporting": "Reporting event: companies and brokers commonly restrict trading and research around results",
     "Press release": "Company announcement furnished or filed with the SEC",
     "Distress": "Credit or listing risk: possible restructuring, covenant or delisting issues",
+    "Regulatory / clinical": "Regulatory or clinical milestone: can move the stock and trigger research and trading restrictions",
+    "Legal / regulatory action": "Litigation or regulatory action: reputational and conflicts review",
+    "Business update": "Partnership, product or contract news",
 }
+
+# Keyword rules for classifying web news into event categories (first match wins)
+NEWS_RULES = [
+    ("M&A", r"\b(acquir\w*|acquisition|merg\w*|takeover|buyout|tender offer|to buy|bid for|divest\w*|spin-?off|go(ing)?[- ]private)\b"),
+    ("Capital markets", r"\b(ipo|initial public offering|public offering|priced|prices \$|raises? \$|private placement|"
+                        r"convertible|senior notes|notes due|share sale|secondary offering|at-the-market|financing round|shelf)\b"),
+    ("Activism / ownership", r"\b(activist|stake in|proxy fight|board seats?|13d)\b"),
+    ("Regulatory / clinical", r"\b(fda|ema|health canada|approv\w*|clearance|phase [123i]+|clinical trial|topline|data readout|pdufa|breakthrough designation)\b"),
+    ("Legal / regulatory action", r"\b(lawsuit|sues|sued|class action|investigation|probe|subpoena|settle\w*|charged|antitrust|doj|sec charges)\b"),
+    ("Distress", r"\b(bankruptcy|chapter 11|default|delist\w*|going concern|restructur\w*|layoffs?|job cuts)\b"),
+    ("Management / governance", r"\b(ceo|cfo|chief executive|chief financial|appoint\w*|steps? down|resign\w*|names .* (chief|president)|board of directors)\b"),
+    ("Earnings / reporting", r"\b(earnings|quarterly results|q[1-4] results|(first|second|third|fourth)[- ]quarter|revenue|guidance|outlook|fiscal (year|quarter))\b"),
+    ("Business update", r"\b(partnership|collaborat\w*|launch\w*|contract|agreement with|deal with|unveil\w*)\b"),
+]
+
+
+def classify_news(title, content=""):
+    text = f"{title} {content}".lower()
+    for cat, pat in NEWS_RULES:
+        if re.search(pat, text):
+            return cat
+    return None
 FORM_EVENTS = {
     "425": ("M&A", "Merger communication (Rule 425)"),
     "S-4": ("M&A", "Merger/exchange offer registration (S-4)"),
@@ -317,7 +344,7 @@ def parse_13dg_xml(text):
 
 def significant_holders(filings, cik, email, years=HOLDER_YEARS, max_filings=25):
     cutoff = (date.today() - timedelta(days=365 * years)).isoformat()
-    holders, n = {}, 0
+    holders, n, cusips = {}, 0, set()
     for f in filings:
         if not f["form"].startswith(("SCHEDULE 13D", "SCHEDULE 13G")) or f["filingDate"] < cutoff:
             continue
@@ -328,10 +355,11 @@ def significant_holders(filings, cik, email, years=HOLDER_YEARS, max_filings=25)
         if not doc.lower().endswith(".xml"):
             continue
         raw, url = src.sec_doc(cik, f["accessionNumber"], doc, email)
+        cusips.update(re.findall(r"<(?:\w+:)?\w*[Cc][Uu][Ss][Ii][Pp]\w*>\s*([0-9A-Z]{9})\s*<", raw or ""))
         for name, pct in parse_13dg_xml(raw):
             holders.setdefault(name.lower(), {"name": name, "pct": pct, "date": f["filingDate"],
                                               "form": f["form"].replace("SCHEDULE ", "Sch. "), "url": url})
-    return sorted(holders.values(), key=lambda h: -(h["pct"] or 0))
+    return sorted(holders.values(), key=lambda h: -(h["pct"] or 0)), cusips
 
 
 # --------------------------------------------------------------------------
@@ -425,12 +453,239 @@ def market_data(company, securities, facts_bs, key, warnings):
 # --------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# How and when the company went public
+# --------------------------------------------------------------------------
+def full_filing_history(sub, email, warnings):
+    """Recent filings plus the older pages EDGAR keeps in separate files (oldest at the end)."""
+    rows = _recent(sub)
+    for f in (sub.get("filings") or {}).get("files") or []:
+        try:
+            txt = src.http_get(f"https://data.sec.gov/submissions/{f['name']}", user_agent=src.sec_ua(email), sec=True)
+            page = json.loads(txt or "{}")
+            n = len(page.get("form", []))
+            rows += [{k: (page.get(k) or [""] * n)[i] for k in
+                      ["form", "filingDate", "accessionNumber", "primaryDocument", "items", "reportDate"]} for i in range(n)]
+        except (src.DataError, json.JSONDecodeError) as e:
+            warnings.append(f"Older filing history: {e}")
+    return sorted(rows, key=lambda f: f["filingDate"], reverse=True)
+
+
+def listing_history(history, cik, company):
+    """Infer how and when the company went public from its EDGAR filing history."""
+    oldest_first = list(reversed(history))
+    first = oldest_first[0]["filingDate"] if oldest_first else None
+    def find(pred):
+        return next((f for f in oldest_first if pred(f)), None)
+    link = lambda f: src.filing_url(cik, f["accessionNumber"], f["primaryDocument"]) if f else ""
+    reg = find(lambda f: f["form"] in ("S-1", "F-1", "S-1/A", "F-1/A", "DRS"))
+    priced = find(lambda f: f["form"] == "424B4" and (reg is None or f["filingDate"] >= reg["filingDate"]))
+    shell_exit = find(lambda f: f["form"].startswith("8-K") and "5.06" in (f.get("items") or ""))
+    form10 = find(lambda f: f["form"] in ("10-12B", "10-12B/A"))
+    mjds = find(lambda f: f["form"] in ("40FR12B", "40-F"))
+    fpi_reg = find(lambda f: f["form"] in ("20FR12B",))
+    succ = find(lambda f: f["form"] == "8-K12B")
+    exch = find(lambda f: f["form"] in ("8-A12B", "8-A12B/A"))
+    spac_name = any(re.search(r"acquisition corp|capital corp|spac", n or "", re.I) for n in company.get("former_names") or [])
+
+    evidence = [(f["form"], f["filingDate"], link(f)) for f in (reg, priced, shell_exit, form10, mjds, fpi_reg, succ, exch) if f]
+    if shell_exit and (spac_name or find(lambda f: f["form"] in ("S-4", "F-4") and f["filingDate"] <= shell_exit["filingDate"])):
+        method, when = "Merger with a SPAC (de-SPAC); exited shell status", shell_exit["filingDate"]
+    elif priced and reg:
+        method, when = "Underwritten initial public offering (IPO)", priced["filingDate"]
+    elif form10:
+        method, when = "Spin-off from a parent company (Form 10 registration)", form10["filingDate"]
+    elif mjds and (not exch or mjds["filingDate"] <= exch["filingDate"]):
+        method, when = "Canadian company listed in the U.S. under the MJDS (Form 40-F registration)", mjds["filingDate"]
+    elif fpi_reg:
+        method, when = "Foreign company registered a class of securities for U.S. listing (Form 20-F)", fpi_reg["filingDate"]
+    elif succ:
+        method, when = "Successor issuer after a reorganization or redomicile (8-K12B)", succ["filingDate"]
+    elif reg and exch and not priced:
+        method, when = "Possible direct listing (registration statement and exchange listing without a priced IPO prospectus)", exch["filingDate"]
+    elif first and first <= "1997-12-31":
+        method, when = "Public before EDGAR electronic filing began (mid-1990s); see web summary", None
+    else:
+        method, when = "Not determinable from EDGAR filings; see web summary", None
+    return {"method": method, "date": when, "first_edgar_filing": first,
+            "exchange_registration": exch["filingDate"] if exch else None, "evidence": evidence}
+
+
+# --------------------------------------------------------------------------
+# Web search: description summary, IPO summary, news and web-detected events
+# --------------------------------------------------------------------------
+def web_description(company, tav_key, warnings, used):
+    name = src.clean_name(company["name"])
+    if tav_key:
+        try:
+            r = src.tavily(f"What does {company['name']} ({company['industry']}) do? Business overview, main products, "
+                           f"customers and headquarters", tav_key, max_results=5)
+            if r["answer"]:
+                used.add("Tavily web search")
+                return {"text": r["answer"], "source": "Web search summary",
+                        "links": [(x["title"], x["url"]) for x in r["results"][:4]]}
+        except src.DataError as e:
+            warnings.append(f"Web description: {e}")
+    try:
+        w = src.wikipedia_summary(company["name"])
+        if w:
+            used.add("Wikipedia")
+            return {"text": w["text"], "source": f"Wikipedia: {w['title']}", "links": [(w["title"], w["url"])]}
+    except (src.DataError, ValueError) as e:
+        warnings.append(f"Wikipedia: {e}")
+    return None
+
+
+def web_ipo_summary(company, tav_key, warnings):
+    if not tav_key:
+        return None
+    try:
+        r = src.tavily(f"When and how did {company['name']} go public? IPO date, exchange, offering price, "
+                       f"or SPAC merger / direct listing / spin-off", tav_key, max_results=5)
+        return {"text": r["answer"], "links": [(x["title"], x["url"]) for x in r["results"][:3]]} if r["answer"] else None
+    except src.DataError as e:
+        warnings.append(f"Web IPO summary: {e}")
+        return None
+
+
+def web_news(company, ticker, tav_key, warnings, used, days=EVENT_DAYS):
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    items = []
+    if tav_key:
+        try:
+            q = f"{company['name']}" + (f" ({ticker})" if ticker else "") + " news"
+            items = src.tavily(q, tav_key, topic="news", days=days, max_results=20, answer=False)["results"]
+            used.add("Tavily web search")
+        except src.DataError as e:
+            warnings.append(f"Web news: {e}")
+    if not items:
+        try:
+            items = src.gdelt_news(src.clean_name(company["name"]))
+            if items:
+                used.add("GDELT news")
+        except src.DataError as e:
+            warnings.append(f"GDELT news: {e}")
+    out, seen = [], set()
+    for it in items:
+        d = _norm_date(it["date"])
+        if d and d < cutoff:
+            continue
+        key = re.sub(r"\W+", " ", it["title"].lower())[:80]
+        if not it["title"] or key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(it, date=d or ""))
+    return sorted(out, key=lambda x: x["date"], reverse=True)
+
+
+def _norm_date(s):
+    """Accepts '2026-11-03', '2026-11-03T10:00:00Z' or 'Mon, 03 Nov 2026 10:00:00 GMT'."""
+    s = (s or "").strip()
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{1,2}) ([A-Za-z]{3}) (\d{4})", s)
+    if m:
+        try:
+            return datetime.strptime(" ".join(m.groups()), "%d %b %Y").date().isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def web_events(news):
+    out = []
+    for n in news:
+        cat = classify_news(n["title"], n.get("content", ""))
+        if cat and n["date"]:                    # undated items stay in the news list only
+            out.append({"date": n["date"], "status": "Reported", "category": cat, "form": n["source"] or "Web",
+                        "title": n["title"], "why": WHY[cat], "url": n["url"]})
+    return out
+
+
+# --------------------------------------------------------------------------
+# Security identifiers: tickers, ISIN, CUSIP, FIGI (SEDOL is licensed)
+# --------------------------------------------------------------------------
+def identifiers(company, securities, cusips_13dg, figi_key, warnings, used):
+    ent = {"CIK": company["cik"], "LEI": company.get("lei") or "", "LEI status": "", "EIN": company.get("ein") or ""}
+    rows, debt = [], []
+    isins = []
+    try:
+        code = {"United States": "US", "Canada": "CA"}
+        countries = tuple({code[x] for x in (company["incorporation_country"], company["hq_country"]) if x in code}) or ("US", "CA")
+        lei = src.gleif_find_lei(company["name"], countries)
+        if lei:
+            ent["LEI"], ent["LEI status"] = lei["lei"], lei["status"]
+            isins = src.gleif_isins(lei["lei"])
+            used.add("GLEIF")
+    except (src.DataError, KeyError, ValueError) as e:
+        warnings.append(f"GLEIF (LEI and ISINs): {e}")
+    # CUSIPs reported on Schedule 13D/13G cover pages fill gaps
+    for c in sorted(cusips_13dg):
+        isin = src.isin_from_cusip(c, "US")
+        if isin not in isins and src.cusip_from_isin(isin) not in {src.cusip_from_isin(i) for i in isins}:
+            isins.append(isin)
+    eq = [i for i in isins if src.isin_valid(i) and src.cusip_kind(src.cusip_from_isin(i)) != "Debt / other"]
+    debt = [{"isin": i, "cusip": src.cusip_from_isin(i)} for i in isins
+            if src.isin_valid(i) and src.cusip_kind(src.cusip_from_isin(i)) == "Debt / other"]
+    eq += [i for i in isins if src.isin_valid(i) and i[:2] not in ("US", "CA") and i not in eq]
+
+    # Map equity ISINs and listed tickers to FIGIs
+    jobs = [{"idType": "ID_ISIN", "idValue": i} for i in eq[:15]]
+    tick_jobs = [{"idType": "TICKER", "idValue": s["ticker"].replace(".", "/") if s["country"] == "US" else s["ticker"],
+                  "exchCode": "US" if s["country"] == "US" else "CN"} for s in securities]
+    figi_by_isin, figi_by_ticker = {}, {}
+    try:
+        res = src.openfigi_map(jobs + tick_jobs, figi_key)
+        used.add("OpenFIGI")
+        for job, data in zip(jobs + tick_jobs, res):
+            comp = [d for d in data if d.get("exchCode") in ("US", "CN")] or data
+            if comp:
+                if job["idType"] == "ID_ISIN":
+                    figi_by_isin[job["idValue"]] = comp
+                else:
+                    figi_by_ticker[(job["idValue"], job["exchCode"])] = [d for d in comp if d.get("exchCode") == job["exchCode"]] or comp
+    except src.DataError as e:
+        warnings.append(f"OpenFIGI: {e}")
+
+    used_isins = set()
+    for s in securities:
+        key = (s["ticker"].replace(".", "/") if s["country"] == "US" else s["ticker"], "US" if s["country"] == "US" else "CN")
+        f = (figi_by_ticker.get(key) or [{}])[0]
+        isin = next((i for i, d in figi_by_isin.items()
+                     if any(x.get("compositeFIGI") and x.get("compositeFIGI") == f.get("compositeFIGI") for x in d)), "")
+        if not isin and s["type"] == "Common Stock":           # fall back to the issuer's only equity ISIN
+            pref = [i for i in eq if i[:2] == ("CA" if company["incorporation_country"] == "Canada" else "US")]
+            isin = pref[0] if len(pref) == 1 else ""
+        used_isins.add(isin)
+        rows.append({"ticker": s["ticker"], "exchange": s["exchange"], "type": f.get("securityType") or s["type"],
+                     "isin": isin, "cusip": src.cusip_from_isin(isin), "figi": f.get("figi", ""),
+                     "composite_figi": f.get("compositeFIGI", ""), "share_class_figi": f.get("shareClassFIGI", ""),
+                     "sedol": "Licensed (not in free sources)"})
+    for i in eq:                                           # equity lines without a listed ticker match
+        if i not in used_isins:
+            f = (figi_by_isin.get(i) or [{}])[0]
+            rows.append({"ticker": f.get("ticker", ""), "exchange": "", "type": f.get("securityType") or "Equity",
+                         "isin": i, "cusip": src.cusip_from_isin(i), "figi": f.get("figi", ""),
+                         "composite_figi": f.get("compositeFIGI", ""), "share_class_figi": f.get("shareClassFIGI", ""),
+                         "sedol": "Licensed (not in free sources)"})
+    return {"entity": ent, "securities": rows, "debt": debt,
+            "notes": ["ISINs come from the GLEIF/ANNA ISIN-to-LEI mapping (CC0) and Schedule 13D/13G cover pages; "
+                      "U.S. and Canadian CUSIPs are characters 3-11 of the ISIN.",
+                      "CUSIP data is owned by CUSIP Global Services; check licensing before publishing CUSIPs publicly.",
+                      "SEDOLs are licensed by LSEG and are not available from free sources."]}
+
+
+# --------------------------------------------------------------------------
+# Main entry point
+# --------------------------------------------------------------------------
 def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None):
     cik = str(cik).zfill(10)
     email = settings.get("SEC_CONTACT_EMAIL", "")
     av_key = settings.get("ALPHAVANTAGE_KEY", "")
-    fh_key = settings.get("FINNHUB_KEY", "")
-    warnings, used = [], ["SEC EDGAR"]
+    tav_key = settings.get("TAVILY_KEY", "")
+    figi_key = settings.get("OPENFIGI_KEY", "")
+    warnings, used = [], {"SEC EDGAR"}
 
     progress("Company record (SEC)")
     sub = src.sec_submissions(cik, email)
@@ -450,19 +705,17 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         "filer_category": sub.get("category") or "", "entity_type": sub.get("entityType") or "",
         "ein": sub.get("ein") or "", "lei": sub.get("lei") or "",
         "foreign_private_issuer": bool(forms & set(FPI_FORMS)) and not (forms & {"10-K", "10-Q"}),
-        "former_names": [n.get("name") for n in (sub.get("formerNames") or [])][:3],
+        "former_names": [n.get("name") for n in (sub.get("formerNames") or [])][:5],
     }
 
-    # Equity securities: every ticker the SEC links to this CIK
-    progress("Equity securities")
+    progress("Listed securities")
     securities = []
     for t in [x for x in sec_tickers if x["cik"] == cik]:
         dot = t["ticker"].replace("-", ".")
         d = symdir.get(dot) or symdir.get(t["ticker"]) or {}
         name = d.get("name") or company["name"]
         securities.append({"ticker": dot, "exchange": d.get("exchange") or t["exchange"] or "OTC",
-                           "country": "US", "name": name,
-                           "type": classify(name, d.get("is_etf"), t["exchange"])})
+                           "country": "US", "name": name, "type": classify(name, d.get("is_etf"), t["exchange"])})
     if company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada":
         try:
             tsx = src.av_search_tsx(company["name"], av_key)
@@ -474,7 +727,6 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
             warnings.append(f"TSX listing lookup: {e}")
     securities.sort(key=lambda s: (s["type"] != "Common Stock", s["country"] != "US", s["ticker"]))
 
-    # Balance sheet and cover-page facts
     progress("Financial facts (SEC XBRL)")
     try:
         facts = src.sec_facts(cik, email)
@@ -483,63 +735,74 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         warnings.append(f"XBRL facts: {e}")
     bs = balance_sheet(facts)
 
-    # Annual report: business description and cover flags
-    progress("Business description (latest annual report)")
-    description, desc_src, flags = "", "", {}
+    progress("Annual report cover and business text")
+    filing_desc, desc_src, flags = "", "", {}
     annual = next((f for f in filings if f["form"] in ANNUAL), None)
     latest_periodic = next((f for f in filings if f["form"] in PERIODIC), None)
     if annual:
-        raw, url = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
+        raw, _ = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
         flags = cover_flags(raw)
-        description = extract_description(raw, annual["form"])
-        if not description and annual["form"] == "40-F":
+        filing_desc = extract_description(raw, annual["form"])
+        if not filing_desc and annual["form"] == "40-F":
             ex = _pick_aif_exhibit(cik, annual, email)
             if ex:
-                raw2, url = src.sec_doc(cik, annual["accessionNumber"], ex, email)
-                description = extract_description(raw2, "40-F")
+                raw2, _ = src.sec_doc(cik, annual["accessionNumber"], ex, email)
+                filing_desc = extract_description(raw2, "40-F")
         desc_src = f"{annual['form']} filed {annual['filingDate']}"
-        # EGC status only changes at fiscal year end, so the annual report cover is enough.
     elif latest_periodic:
         raw, _ = src.sec_doc(cik, latest_periodic["accessionNumber"], latest_periodic["primaryDocument"], email)
         flags = cover_flags(raw)
-    if not description:
-        warnings.append("Business description could not be extracted automatically; see the latest annual report.")
+
+    progress("Business description summary (web)")
+    web_desc = web_description(company, tav_key, warnings, used)
+    if web_desc:
+        description = {"text": web_desc["text"], "source": web_desc["source"], "links": web_desc["links"]}
+    elif filing_desc:
+        description = {"text": filing_desc, "source": desc_src, "links": []}
+    else:
+        description = {"text": "", "source": "", "links": []}
+        warnings.append("No business description found from web search, Wikipedia or the annual report.")
+
+    progress("How and when it went public")
+    history = full_filing_history(sub, email, warnings)
+    listing = listing_history(history, cik, company)
+    listing["web"] = web_ipo_summary(company, tav_key, warnings)
 
     progress("Significant holders (Schedule 13D/13G)")
-    holders = significant_holders(filings, cik, email)
+    holders, cusips = significant_holders(filings, cik, email)
 
-    progress("Corporate events (last 180 days)")
-    events = corporate_events(filings, cik)
+    progress("Security identifiers (GLEIF, OpenFIGI)")
+    ids = identifiers(company, securities, cusips, figi_key, warnings, used)
+    if ids["entity"].get("LEI"):
+        company["lei"] = ids["entity"]["LEI"]
 
     progress("Market data")
     if av_key:
-        used.append("Alpha Vantage")
-    market = market_data(company, securities, bs, av_key, warnings) if av_key else {"venues": [], "fx": {"USD": 1.0}}
-    if not av_key:
+        used.add("Alpha Vantage")
+        market = market_data(company, securities, bs, av_key, warnings)
+    else:
+        market = {"venues": [], "fx": {"USD": 1.0}}
         warnings.append("Market data is off: add a free Alpha Vantage key (ALPHAVANTAGE_KEY) in the app settings.")
         if bs.get("public_float"):
             market["public_float_usd"], market["public_float_date"] = bs["public_float"]["value"], bs["public_float"]["date"]
         if bs.get("shares_out"):
             market["shares_out"], market["shares_out_date"] = bs["shares_out"]["value"], bs["shares_out"]["date"]
 
-    progress("News")
-    news = []
+    progress("News and corporate events (last 90 days)")
     us_common = next((s for s in securities if s["country"] == "US" and s["type"] == "Common Stock"), None)
-    if fh_key and us_common:
-        try:
-            news = src.finnhub_news(us_common["ticker"], fh_key)[:25]
-            used.append("Finnhub")
-        except src.DataError as e:
-            warnings.append(f"News: {e}")
-    elif not fh_key:
-        warnings.append("News headlines are off: add a free Finnhub key (FINNHUB_KEY). Filed press releases still appear under events.")
+    news = web_news(company, us_common["ticker"] if us_common else "", tav_key, warnings, used)
+    if not tav_key:
+        warnings.append("Web search is off: add a free Tavily key (TAVILY_KEY) for the description summary, IPO summary "
+                        "and fuller news. News falls back to GDELT.")
+    events = sorted(corporate_events(filings, cik) + web_events(news), key=lambda e: e["date"], reverse=True)
 
     profile = {
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "company": company, "cover": flags, "financials": bs, "market": market,
-        "description": description, "description_source": desc_src,
-        "securities": securities, "holders": holders, "events": events, "news": news,
-        "filings": filings, "warnings": warnings, "sources": used,
+        "description": description, "filing_excerpt": filing_desc, "filing_excerpt_source": desc_src,
+        "listing": listing, "identifiers": ids,
+        "securities": securities, "holders": holders, "events": events, "news": news[:25],
+        "filings": filings, "warnings": warnings, "sources": sorted(used),
     }
     profile["regm"] = regm.analyse(profile)
     return profile

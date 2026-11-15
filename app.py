@@ -1,11 +1,12 @@
 """
-Entity Profile: U.S. and Canadian Technology and Biotech companies.
+Entity Profile: U.S. and Canadian Technology and Biotech companies (public data only).
 
 Run locally:   streamlit run app.py
 Settings (Streamlit "Secrets" or environment variables):
   SEC_CONTACT_EMAIL   required; the SEC asks for a contact email
-  ALPHAVANTAGE_KEY    free key for prices and volumes (market data, ADTV)
-  FINNHUB_KEY         free key for news headlines (optional)
+  TAVILY_KEY          free key for web search (description summary, IPO summary, news)
+  ALPHAVANTAGE_KEY    free key for prices and volumes
+  OPENFIGI_KEY        optional; raises OpenFIGI rate limits
 """
 import os
 
@@ -17,6 +18,7 @@ from entity_profile import build_profile
 from pdf_report import make_pdf
 
 st.set_page_config(page_title="Entity Profile", page_icon="📇", layout="wide")
+KEYS = ("SEC_CONTACT_EMAIL", "TAVILY_KEY", "ALPHAVANTAGE_KEY", "OPENFIGI_KEY")
 
 
 def setting(name):
@@ -28,7 +30,7 @@ def setting(name):
     return os.environ.get(name, "")
 
 
-SETTINGS = {k: setting(k) for k in ("SEC_CONTACT_EMAIL", "ALPHAVANTAGE_KEY", "FINNHUB_KEY")}
+SETTINGS = {k: setting(k) for k in KEYS}
 
 
 # ---------------------------------------------------------------- cached data
@@ -64,7 +66,6 @@ def cached_pdf(cik, as_of, _profile):
     return make_pdf(_profile)
 
 
-# ---------------------------------------------------------------- formatting
 def money(v, ccy="", dec=2):
     if v is None:
         return "n/a"
@@ -74,89 +75,84 @@ def money(v, ccy="", dec=2):
     return f"{ccy} {v:,.{dec}f}".strip()
 
 
-STATUS_ICON = {"ok": "🟢", "warn": "🟠", "info": "🔵", "na": "⚪"}
+def links_md(links):
+    return " · ".join(f"[{(t or u)[:60]}]({u})" for t, u in links if u)
 
 
-# ---------------------------------------------------------------- sidebar
-st.sidebar.title("Entity Profile")
-st.sidebar.caption("U.S. and Canadian Technology and Biotech companies · public data only")
-
+# ---------------------------------------------------------------- setup check
 if not SETTINGS["SEC_CONTACT_EMAIL"]:
     st.error("Setup needed: add SEC_CONTACT_EMAIL in the app's Secrets (README, step 6).")
     st.stop()
 
+# ---------------------------------------------------------------- sidebar filters
+st.sidebar.title("Entity Profile")
+st.sidebar.caption("U.S. and Canadian Technology and Biotech companies · public data only")
 uni = load_universe()
-mode = st.sidebar.radio("Find a company", ["Browse Tech & Biotech list", "Look up any ticker"],
-                        index=0 if len(uni) else 1)
-cik = None
-if mode == "Browse Tech & Biotech list":
-    if not len(uni):
-        st.sidebar.warning("The company list has not been built yet (README, step 5). Use ticker lookup for now.")
-    else:
-        sectors = st.sidebar.multiselect("Sector", ["Technology", "Biotech"], default=["Technology", "Biotech"])
-        countries = st.sidebar.multiselect("Headquarters", ["United States", "Canada"], default=["United States", "Canada"])
-        q = st.sidebar.text_input("Search name or ticker").strip().lower()
-        f = uni[uni["sector"].isin(sectors) & uni["hq_country"].isin(countries)]
-        if q:
-            f = f[f["name"].str.lower().str.contains(q, regex=False) | f["tickers"].str.lower().str.contains(q, regex=False)]
-        st.sidebar.caption(f"{len(f):,} of {len(uni):,} companies")
-        labels = [f"{r.name} ({r.tickers.split()[0]})" for r in f.itertuples()]
-        pick = st.sidebar.selectbox("Company", labels, index=None, placeholder="Choose a company")
-        if pick:
-            cik = f.iloc[labels.index(pick)]["cik"]
-else:
-    t = st.sidebar.text_input("Ticker (U.S. listing)", placeholder="e.g. SHOP or MRNA").strip().upper()
-    if t:
-        try:
-            match = next((x for x in load_sec_tickers(SETTINGS["SEC_CONTACT_EMAIL"])
-                          if x["ticker"] == t.replace(".", "-")), None)
-        except src.DataError as e:
-            match = None
-            st.sidebar.error(str(e))
-        if match:
-            cik = match["cik"]
-            st.sidebar.success(f"{match['name']} · CIK {cik}")
-        else:
-            st.sidebar.warning("Not found among SEC-registered tickers.")
-
-go = st.sidebar.button("Show profile", type="primary", disabled=cik is None, use_container_width=True)
+sectors = st.sidebar.multiselect("Sector", ["Technology", "Biotech"], default=["Technology", "Biotech"])
+countries = st.sidebar.multiselect("Headquarters", ["United States", "Canada"], default=["United States", "Canada"])
+all_listed = st.sidebar.toggle("Include every SEC-listed company", value=not len(uni),
+                               help="Search all companies with a U.S. listing, not only Technology and Biotech.")
 st.sidebar.divider()
-st.sidebar.caption("Market data: " + ("on" if SETTINGS["ALPHAVANTAGE_KEY"] else "off (no Alpha Vantage key)") +
-                   " · News: " + ("on" if SETTINGS["FINNHUB_KEY"] else "off (no Finnhub key)"))
-st.sidebar.caption("Profiles are cached for 6 hours to save free API calls.")
+st.sidebar.caption(
+    "Web search: " + ("on" if SETTINGS["TAVILY_KEY"] else "off (no Tavily key; news falls back to GDELT)") +
+    "  \nMarket data: " + ("on" if SETTINGS["ALPHAVANTAGE_KEY"] else "off (no Alpha Vantage key)") +
+    "  \nProfiles are cached for 6 hours to save free API calls.")
 
-if go and cik:
-    status = st.status("Gathering public data…", expanded=False)
+# ---------------------------------------------------------------- type-ahead company search
+options = {}
+f = uni[uni["sector"].isin(sectors) & uni["hq_country"].isin(countries)] if len(uni) else uni
+for r in f.itertuples():
+    options[f"{r.name} — {r.tickers.split()[0] if r.tickers else ''} · {r.sector} · {r.hq_country}"] = r.cik
+if all_listed:
     try:
-        st.session_state["profile"] = cached_profile(cik, tuple(sorted(SETTINGS.items())))
-        status.update(label="Done", state="complete")
+        seen = set(options.values())
+        for t in load_sec_tickers(SETTINGS["SEC_CONTACT_EMAIL"]):
+            if t["exchange"] in ("Nasdaq", "NYSE", "CBOE") and t["cik"] not in seen:
+                seen.add(t["cik"])
+                options[f"{t['name']} — {t['ticker']} · {t['exchange']}"] = t["cik"]
     except src.DataError as e:
-        status.update(label="Could not build the profile", state="error")
-        st.error(str(e))
+        st.sidebar.error(str(e))
+
+st.title("Entity Profile")
+pick = st.selectbox("Company", sorted(options, key=str.lower), index=None,
+                    placeholder=f"Start typing a company name or ticker ({len(options):,} companies)…",
+                    label_visibility="collapsed")
+if pick:
+    cik = options[pick]
+    if st.session_state.get("cik") != cik:
+        with st.status("Gathering public data…", expanded=False) as status:
+            try:
+                st.session_state["profile"] = cached_profile(cik, tuple(sorted(SETTINGS.items())))
+                st.session_state["cik"] = cik
+                status.update(label="Done", state="complete")
+            except src.DataError as e:
+                status.update(label="Could not build the profile", state="error")
+                st.error(str(e))
 
 p = st.session_state.get("profile")
 if not p:
-    st.title("Entity Profile")
-    st.write("Choose a company in the sidebar and press **Show profile**. Each profile includes market data, "
-             "the business description, equity securities, 5%+ holders, corporate events and news from the "
-             "last 180 days, and a Regulation M and research safe harbor screen. Export any profile as a "
-             "one- to two-page PDF.")
+    st.write("Type a company name or ticker above. Matches appear as you type. Each profile shows market data, "
+             "a business description summary, how and when the company went public, security identifiers, "
+             "5%+ holders, corporate events and news from the last 90 days, and a research safe harbor summary. "
+             "Any profile can be exported as a one- to two-page PDF.")
+    if not len(uni):
+        st.info("The Technology and Biotech list has not been built yet (README, step 5). "
+                "Until then, every SEC-listed company is searchable.")
     st.stop()
 
 # ---------------------------------------------------------------- profile
-c, m, r = p["company"], p["market"], p["regm"]
+c, m, r, ids, lst = p["company"], p["market"], p["regm"], p["identifiers"], p["listing"]
 pv = m.get("primary") or {}
 head, btn = st.columns([4, 1])
 with head:
-    st.title(c["name"])
+    st.header(c["name"])
     commons = ", ".join(f"{s['ticker']} ({s['exchange']})" for s in p["securities"] if s["type"] == "Common Stock")
-    st.caption(f"{commons} · {c['sector']} · {c['industry']} · CIK {c['cik']} · "
-               f"HQ {', '.join(x for x in (c['hq_city'], c['hq_country']) if x)} · as of {p['as_of']}")
+    st.caption(f"{commons} · {c['sector']} · {c['industry']} · HQ {', '.join(x for x in (c['hq_city'], c['hq_country']) if x)} "
+               f"· Incorporated {c['incorporation']} · as of {p['as_of']}")
 with btn:
     st.download_button("⬇ Export PDF summary", data=cached_pdf(c["cik"], p["as_of"], p),
                        file_name=f"{(commons.split(' ')[0] or c['cik'])}_entity_profile.pdf",
                        mime="application/pdf", use_container_width=True, type="primary")
-
 if p["warnings"]:
     with st.expander(f"Data notes ({len(p['warnings'])})"):
         for w in p["warnings"]:
@@ -169,78 +165,99 @@ cols = st.columns(4)
 cols[0].metric("Price", money(pv.get("price"), ccy) if pv else "n/a",
                f"{pv['change_1m_pct']:+.1f}% 1M" if pv.get("change_1m_pct") is not None else None,
                help=f"{pv.get('exchange', '')} close {pv.get('price_date', '')}")
-cols[1].metric("Market cap", money(m.get("market_cap"), m.get("market_cap_ccy", "")),
-               help=f"Shares outstanding {m.get('shares_out', 0):,.0f} as of {m.get('shares_out_date', '')}" if m.get("shares_out") else None)
+cols[1].metric("Market cap", money(m.get("market_cap"), m.get("market_cap_ccy", "")))
 cols[2].metric("Enterprise value", money(m.get("enterprise_value"), ccy),
-               help=f"Cash {money(m.get('cash'), ccy)}, debt {money(m.get('debt'), ccy)} as of {m.get('bs_date', '')}" if m.get("enterprise_value") is not None else None)
+               help=f"Cash {money(m.get('cash'), ccy)}, debt {money(m.get('debt'), ccy)}" if m.get("enterprise_value") is not None else None)
 cols[3].metric("52-week range", f"{money(pv.get('low_52w'))} – {money(pv.get('high_52w'))}" if pv.get("high_52w") else "n/a")
 cols = st.columns(4)
 cols[0].metric("Public float (reported)", money(m.get("public_float_usd"), "US$"),
                help=f"Annual report cover, as of {m.get('public_float_date', '')}")
-cols[1].metric("Avg daily volume (60d)", f"{m['adv_shares_total']:,.0f}" if m.get("adv_shares_total") else "n/a")
-cols[2].metric("ADTV worldwide (60d)", money(m.get("adtv_usd"), "US$"), help="Average daily value traded across venues, in USD")
-cols[3].metric("Venues", ", ".join(v["exchange"] for v in m.get("venues", [])) or "n/a")
+cols[1].metric("Shares outstanding", f"{m['shares_out']:,.0f}" if m.get("shares_out") else "n/a")
+cols[2].metric("Avg daily volume (60d)", f"{m['adv_shares_total']:,.0f}" if m.get("adv_shares_total") else "n/a")
+cols[3].metric("ADTV worldwide (60d)", money(m.get("adtv_usd"), "US$"))
 
 # Business description
 st.subheader("Business description")
-st.write(p["description"] or "_Not available. See the latest annual report._")
-if p["description_source"]:
-    st.caption(f"Source: {p['description_source']}")
+d = p["description"]
+st.write(d["text"] or "_Not available._")
+if d["source"]:
+    st.caption(f"Source: {d['source']}" + (f" · {links_md(d['links'])}" if d["links"] else ""))
+if p.get("filing_excerpt") and d["source"] != p.get("filing_excerpt_source"):
+    with st.expander(f"Excerpt from the annual report ({p['filing_excerpt_source']})"):
+        st.write(p["filing_excerpt"])
 
-left, right = st.columns([3, 2])
-with left:
-    st.subheader(f"Equity securities ({len(p['securities'])})")
-    st.dataframe(pd.DataFrame([{k: s[k] for k in ("ticker", "name", "type", "exchange", "country")} for s in p["securities"]]),
-                 hide_index=True, use_container_width=True)
-with right:
-    st.subheader("Significant holders (5%+)")
-    if p["holders"]:
-        st.dataframe(pd.DataFrame([{"Holder": h["name"], "% of class": h["pct"], "Form": h["form"], "Filed": h["date"]}
-                                   for h in p["holders"]]), hide_index=True, use_container_width=True,
-                     column_config={"% of class": st.column_config.ProgressColumn(format="%.1f%%", min_value=0,
-                                                                                  max_value=max(10, max((h["pct"] or 0) for h in p["holders"])))})
+# How and when it went public
+st.subheader("How and when it went public")
+a, b = st.columns([2, 3])
+with a:
+    st.markdown(f"**{lst['method']}**")
+    st.write(f"Date: **{lst['date'] or 'n/a'}**")
+    st.caption(f"First EDGAR filing: {lst['first_edgar_filing'] or 'n/a'} · Exchange registration (8-A): "
+               f"{lst['exchange_registration'] or 'n/a'}")
+    for form, dt, url in lst["evidence"]:
+        st.caption(f"[{form} filed {dt}]({url})")
+with b:
+    if lst.get("web"):
+        st.write(lst["web"]["text"])
+        st.caption("Web search summary · " + links_md(lst["web"]["links"]))
     else:
-        st.caption("No Schedule 13D/13G filings in the last three years.")
+        st.caption("Add a Tavily key for a web summary of the IPO or listing.")
+
+# Identifiers
+st.subheader("Security identifiers")
+e = ids["entity"]
+st.write(f"**CIK** {e['CIK']} · **LEI** {e['LEI'] or 'not found'}" + (f" ({e['LEI status']})" if e.get("LEI status") else "")
+         + (f" · **EIN** {e['EIN']}" if e.get("EIN") else ""))
+if ids["securities"]:
+    st.dataframe(pd.DataFrame([{"Ticker": x["ticker"], "Exchange": x["exchange"], "Type": x["type"], "ISIN": x["isin"],
+                                "CUSIP": x["cusip"], "FIGI": x["figi"], "Composite FIGI": x["composite_figi"],
+                                "Share class FIGI": x["share_class_figi"], "SEDOL": x["sedol"]} for x in ids["securities"]]),
+                 hide_index=True, use_container_width=True)
+if ids["debt"]:
+    with st.expander(f"Debt and other ISINs mapped to this issuer ({len(ids['debt'])})"):
+        st.dataframe(pd.DataFrame(ids["debt"]).rename(columns={"isin": "ISIN", "cusip": "CUSIP"}),
+                     hide_index=True, use_container_width=True)
+for n in ids["notes"]:
+    st.caption(n)
+
+# Holders
+st.subheader("Significant holders (5%+)")
+if p["holders"]:
+    st.dataframe(pd.DataFrame([{"Holder": h["name"], "% of class": h["pct"], "Form": h["form"], "Filed": h["date"]}
+                               for h in p["holders"]]), hide_index=True, use_container_width=True,
+                 column_config={"% of class": st.column_config.ProgressColumn(
+                     format="%.1f%%", min_value=0, max_value=max(10, max((h["pct"] or 0) for h in p["holders"])))})
+else:
+    st.caption("No Schedule 13D/13G filings in the last three years.")
 
 # Events and news
-st.subheader("Corporate events and news (last 180 days)")
+st.subheader("Corporate events and news (last 90 days)")
 tab_ev, tab_news = st.tabs([f"Events ({len(p['events'])})", f"News ({len(p['news'])})"])
 with tab_ev:
     if p["events"]:
-        cats = sorted({e["category"] for e in p["events"]})
-        pick = st.multiselect("Category", cats, default=cats, key="evcats")
-        ev = [e for e in p["events"] if e["category"] in pick]
-        st.dataframe(pd.DataFrame([{"Date": e["date"], "Status": e["status"], "Category": e["category"],
-                                    "Event": e["title"], "Why it matters": e["why"], "Filing": e["url"]} for e in ev]),
+        cats = sorted({x["category"] for x in p["events"]})
+        chosen = st.multiselect("Category", cats, default=cats, key="evcats")
+        st.dataframe(pd.DataFrame([{"Date": x["date"], "Category": x["category"], "Event": x["title"],
+                                    "Status": x["status"], "Source": x["form"], "Link": x["url"]}
+                                   for x in p["events"] if x["category"] in chosen]),
                      hide_index=True, use_container_width=True,
-                     column_config={"Filing": st.column_config.LinkColumn(display_text="open")})
+                     column_config={"Link": st.column_config.LinkColumn(display_text="open")})
+        st.caption("Filed = SEC filing · Reported = found in web news · Estimated = worked out from filing history.")
     else:
-        st.caption("No relevant filings in the last 180 days.")
+        st.caption("No events found in the last 90 days.")
 with tab_news:
     if p["news"]:
         for n in p["news"]:
-            st.markdown(f"**{n['date']}** · [{n['headline']}]({n['url']}) · _{n['source']}_")
+            st.markdown(f"**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
     else:
-        st.caption("No news loaded. Add a FINNHUB_KEY to show headlines; filed press releases appear under Events.")
+        st.caption("No news found in the last 90 days.")
 
-# Reg M
-st.subheader("Regulation M and research safe harbors")
+# Safe harbor summary
+st.subheader("Research safe harbor summary")
 st.info(r["summary"])
-st.caption("Preliminary automated screen from public data. Not legal advice: confirm with Legal and Compliance.")
-a, b = st.columns([2, 3])
-with a:
-    st.markdown("**Inputs**")
-    st.dataframe(pd.DataFrame(r["inputs"], columns=["Data point", "Value", "Source"]), hide_index=True, use_container_width=True)
-with b:
-    st.markdown("**Trading restrictions**")
-    st.dataframe(pd.DataFrame([{"": STATUS_ICON[t["status"]], "Rule": t["rule"], "Result": t["result"],
-                                "Test": t["test"], "Applies to": t["who"]} for t in r["tests"]]),
-                 hide_index=True, use_container_width=True)
-st.markdown("**Research safe harbors**")
-st.dataframe(pd.DataFrame([{"Safe harbor": h["name"], "Status": h["status"], "Basis": h["basis"],
-                            "Firm checks": h["firm_checks"]} for h in r["harbors"]]),
-             hide_index=True, use_container_width=True)
-for cav in r["caveats"][1:]:
-    st.caption(cav)
+fc = st.columns(len(r["facts"]))
+for col, (lab, val) in zip(fc, r["facts"]):
+    col.metric(lab, val)
+st.dataframe(pd.DataFrame(r["harbors"], columns=["Safe harbor", "Status", "Basis"]), hide_index=True, use_container_width=True)
 st.divider()
 st.caption("Sources: " + ", ".join(p["sources"]) + ". Public data only; not investment or legal advice.")
