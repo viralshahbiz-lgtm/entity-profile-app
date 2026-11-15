@@ -255,9 +255,11 @@ with tab_news:
 # Safe harbor summary
 st.subheader("Research safe harbor summary")
 st.info(r["summary"])
-fc = st.columns(len(r["facts"]))
-for col, (lab, val) in zip(fc, r["facts"]):
-    col.metric(lab, val)
-st.dataframe(pd.DataFrame(r["harbors"], columns=["Safe harbor", "Status", "Basis"]), hide_index=True, use_container_width=True)
+if r.get("facts"):
+    fc = st.columns(len(r["facts"]))
+    for col, (lab, val) in zip(fc, r["facts"]):
+        col.metric(lab, val)
+if r.get("harbors"):
+    st.dataframe(pd.DataFrame(r["harbors"], columns=["Safe harbor", "Status", "Basis"]), hide_index=True, use_container_width=True)
 st.divider()
 st.caption("Sources: " + ", ".join(p["sources"]) + ". Public data only; not investment or legal advice.")

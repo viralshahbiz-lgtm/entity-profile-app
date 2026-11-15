@@ -318,6 +318,16 @@ def balance_sheet(facts):
 # --------------------------------------------------------------------------
 # Schedule 13D / 13G holders
 # --------------------------------------------------------------------------
+def _to_pct(v):
+    """'5.2', '5.2%', '  7 ' -> float; '.', 'N/A', 'Less than 5' -> None."""
+    m = re.search(r"\d+(?:\.\d+)?", v or "")
+    try:
+        val = float(m.group()) if m else None
+    except ValueError:
+        return None
+    return val if val is not None and 0 <= val <= 100 else None
+
+
 def parse_13dg_xml(text):
     try:
         root = ET.fromstring((text or "").encode("utf-8"))
@@ -334,8 +344,7 @@ def parse_13dg_xml(text):
             if name is None and ("reportingpersonname" in t or t in ("nameofreportingperson", "personname")):
                 name = v
             elif pct is None and "percent" in t:
-                m = re.search(r"[\d.]+", v)
-                pct = float(m.group()) if m else None
+                pct = _to_pct(v)
         if name and name.lower() not in seen:
             seen.add(name.lower())
             out.append((name, pct))
@@ -354,7 +363,10 @@ def significant_holders(filings, cik, email, years=HOLDER_YEARS, max_filings=25)
         doc = f["primaryDocument"].split("/")[-1]
         if not doc.lower().endswith(".xml"):
             continue
-        raw, url = src.sec_doc(cik, f["accessionNumber"], doc, email)
+        try:
+            raw, url = src.sec_doc(cik, f["accessionNumber"], doc, email)
+        except src.DataError:
+            continue
         cusips.update(re.findall(r"<(?:\w+:)?\w*[Cc][Uu][Ss][Ii][Pp]\w*>\s*([0-9A-Z]{9})\s*<", raw or ""))
         for name, pct in parse_13dg_xml(raw):
             holders.setdefault(name.lower(), {"name": name, "pct": pct, "date": f["filingDate"],
@@ -679,6 +691,15 @@ def identifiers(company, securities, cusips_13dg, figi_key, warnings, used):
 # --------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------
+def _safe(label, fn, default, warnings):
+    """Run one profile section; if it fails, record a note and carry on with the rest."""
+    try:
+        return fn()
+    except Exception as e:                     # noqa: BLE001 - keep the page up whatever a source returns
+        warnings.append(f"{label} could not be loaded ({type(e).__name__}: {str(e)[:120]}).")
+        return default
+
+
 def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None):
     cik = str(cik).zfill(10)
     email = settings.get("SEC_CONTACT_EMAIL", "")
@@ -728,33 +749,34 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
     securities.sort(key=lambda s: (s["type"] != "Common Stock", s["country"] != "US", s["ticker"]))
 
     progress("Financial facts (SEC XBRL)")
-    try:
-        facts = src.sec_facts(cik, email)
-    except src.DataError as e:
-        facts = {}
-        warnings.append(f"XBRL facts: {e}")
-    bs = balance_sheet(facts)
+    facts = _safe("Financial facts (SEC XBRL)", lambda: src.sec_facts(cik, email), {}, warnings)
+    bs = _safe("Balance sheet figures", lambda: balance_sheet(facts),
+               {"shares_out": None, "public_float": None, "cash": None, "debt": None, "revenue": None}, warnings)
 
     progress("Annual report cover and business text")
     filing_desc, desc_src, flags = "", "", {}
     annual = next((f for f in filings if f["form"] in ANNUAL), None)
     latest_periodic = next((f for f in filings if f["form"] in PERIODIC), None)
-    if annual:
-        raw, _ = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
-        flags = cover_flags(raw)
-        filing_desc = extract_description(raw, annual["form"])
-        if not filing_desc and annual["form"] == "40-F":
-            ex = _pick_aif_exhibit(cik, annual, email)
-            if ex:
-                raw2, _ = src.sec_doc(cik, annual["accessionNumber"], ex, email)
-                filing_desc = extract_description(raw2, "40-F")
-        desc_src = f"{annual['form']} filed {annual['filingDate']}"
-    elif latest_periodic:
-        raw, _ = src.sec_doc(cik, latest_periodic["accessionNumber"], latest_periodic["primaryDocument"], email)
-        flags = cover_flags(raw)
+
+    def read_annual():
+        nonlocal filing_desc, desc_src, flags
+        if annual:
+            raw, _ = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
+            flags = cover_flags(raw)
+            filing_desc = extract_description(raw, annual["form"])
+            if not filing_desc and annual["form"] == "40-F":
+                ex = _pick_aif_exhibit(cik, annual, email)
+                if ex:
+                    raw2, _ = src.sec_doc(cik, annual["accessionNumber"], ex, email)
+                    filing_desc = extract_description(raw2, "40-F")
+            desc_src = f"{annual['form']} filed {annual['filingDate']}"
+        elif latest_periodic:
+            raw, _ = src.sec_doc(cik, latest_periodic["accessionNumber"], latest_periodic["primaryDocument"], email)
+            flags = cover_flags(raw)
+    _safe("Annual report cover and text", read_annual, None, warnings)
 
     progress("Business description summary (web)")
-    web_desc = web_description(company, tav_key, warnings, used)
+    web_desc = _safe("Web description", lambda: web_description(company, tav_key, warnings, used), None, warnings)
     if web_desc:
         description = {"text": web_desc["text"], "source": web_desc["source"], "links": web_desc["links"]}
     elif filing_desc:
@@ -764,22 +786,27 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         warnings.append("No business description found from web search, Wikipedia or the annual report.")
 
     progress("How and when it went public")
-    history = full_filing_history(sub, email, warnings)
-    listing = listing_history(history, cik, company)
-    listing["web"] = web_ipo_summary(company, tav_key, warnings)
+    history = _safe("Older filing history", lambda: full_filing_history(sub, email, warnings), filings, warnings)
+    listing = _safe("Listing history", lambda: listing_history(history, cik, company),
+                    {"method": "Not determinable", "date": None, "first_edgar_filing": None,
+                     "exchange_registration": None, "evidence": []}, warnings)
+    listing["web"] = _safe("Web IPO summary", lambda: web_ipo_summary(company, tav_key, warnings), None, warnings)
 
     progress("Significant holders (Schedule 13D/13G)")
-    holders, cusips = significant_holders(filings, cik, email)
+    holders, cusips = _safe("Significant holders", lambda: significant_holders(filings, cik, email), ([], set()), warnings)
 
     progress("Security identifiers (GLEIF, OpenFIGI)")
-    ids = identifiers(company, securities, cusips, figi_key, warnings, used)
+    ids = _safe("Security identifiers", lambda: identifiers(company, securities, cusips, figi_key, warnings, used),
+                {"entity": {"CIK": cik, "LEI": "", "LEI status": "", "EIN": company.get("ein") or ""},
+                 "securities": [], "debt": [], "notes": []}, warnings)
     if ids["entity"].get("LEI"):
         company["lei"] = ids["entity"]["LEI"]
 
     progress("Market data")
     if av_key:
         used.add("Alpha Vantage")
-        market = market_data(company, securities, bs, av_key, warnings)
+        market = _safe("Market data", lambda: market_data(company, securities, bs, av_key, warnings),
+                       {"venues": [], "fx": {"USD": 1.0}}, warnings)
     else:
         market = {"venues": [], "fx": {"USD": 1.0}}
         warnings.append("Market data is off: add a free Alpha Vantage key (ALPHAVANTAGE_KEY) in the app settings.")
@@ -790,11 +817,12 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
 
     progress("News and corporate events (last 90 days)")
     us_common = next((s for s in securities if s["country"] == "US" and s["type"] == "Common Stock"), None)
-    news = web_news(company, us_common["ticker"] if us_common else "", tav_key, warnings, used)
+    news = _safe("News", lambda: web_news(company, us_common["ticker"] if us_common else "", tav_key, warnings, used), [], warnings)
     if not tav_key:
         warnings.append("Web search is off: add a free Tavily key (TAVILY_KEY) for the description summary, IPO summary "
                         "and fuller news. News falls back to GDELT.")
-    events = sorted(corporate_events(filings, cik) + web_events(news), key=lambda e: e["date"], reverse=True)
+    events = sorted(_safe("Corporate events", lambda: corporate_events(filings, cik), [], warnings) +
+                    _safe("Web events", lambda: web_events(news), [], warnings), key=lambda e: e["date"], reverse=True)
 
     profile = {
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -804,7 +832,9 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         "securities": securities, "holders": holders, "events": events, "news": news[:25],
         "filings": filings, "warnings": warnings, "sources": sorted(used),
     }
-    profile["regm"] = regm.analyse(profile)
+    profile["regm"] = _safe("Safe harbor summary", lambda: regm.analyse(profile),
+                            {"summary": "Safe harbor summary unavailable.", "harbors": [], "facts": [], "actively_traded": None},
+                            warnings)
     return profile
 
 

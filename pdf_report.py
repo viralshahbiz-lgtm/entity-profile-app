@@ -165,12 +165,15 @@ def build_story(p, lim):
                                 grid(nrows, [0.75 * inch, W - 2.05 * inch, 1.3 * inch])])]
 
     # Safe harbor summary
-    frows = [[P(lab, "cellm") for lab, _ in r["facts"]], [P(v, "cellb") for _, v in r["facts"]]]
-    hrows2 = [[P("Safe harbor", "cellb"), P("Status", "cellb"), P("Basis", "cellb")]] + \
-             [[P(n, "cellb"), P(st, "cellb"), P(b, "cellm")] for n, st, b in r["harbors"]]
-    story += [KeepTogether([Paragraph("RESEARCH SAFE HARBOR SUMMARY", S["h"]), Paragraph(escape(r["summary"]), S["body"]),
-                            Spacer(1, 3), grid(frows, [W / len(r["facts"])] * len(r["facts"]), header=False), Spacer(1, 3),
-                            grid(hrows2, [2.1 * inch, 1.9 * inch, W - 4.0 * inch])])]
+    block = [Paragraph("RESEARCH SAFE HARBOR SUMMARY", S["h"]), Paragraph(escape(r["summary"]), S["body"])]
+    if r.get("facts"):
+        frows = [[P(lab, "cellm") for lab, _ in r["facts"]], [P(v, "cellb") for _, v in r["facts"]]]
+        block += [Spacer(1, 3), grid(frows, [W / len(r["facts"])] * len(r["facts"]), header=False)]
+    if r.get("harbors"):
+        hrows2 = [[P("Safe harbor", "cellb"), P("Status", "cellb"), P("Basis", "cellb")]] + \
+                 [[P(n, "cellb"), P(st, "cellb"), P(b, "cellm")] for n, st, b in r["harbors"]]
+        block += [Spacer(1, 3), grid(hrows2, [2.1 * inch, 1.9 * inch, W - 4.0 * inch])]
+    story += [KeepTogether(block)]
     story += [Spacer(1, 6), Paragraph(escape(
         "Public data only: SEC EDGAR, GLEIF, OpenFIGI, exchange symbol files, web search and the market data provider named above. "
         "Web summaries are machine-generated from search results and should be checked against the linked sources. "
