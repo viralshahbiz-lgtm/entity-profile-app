@@ -291,8 +291,8 @@ def tavily(query, key, topic="general", days=None, max_results=10, answer=True):
 # --------------------------------------------------------------------------
 # GDELT news search (free, no key; covers roughly the last 3 months)
 # --------------------------------------------------------------------------
-def gdelt_news(phrase, max_records=75, timespan="3m"):
-    q = f'"{phrase}" sourcelang:english'
+def gdelt_news(phrase, max_records=75, timespan="3m", extra=""):
+    q = f'"{phrase}" {extra} sourcelang:english'.replace("  ", " ")
     txt = http_get(GDELT_URL, params={"query": q, "mode": "ArtList", "format": "json", "maxrecords": max_records,
                                       "timespan": timespan, "sort": "DateDesc"})
     try:

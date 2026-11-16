@@ -41,7 +41,11 @@ WHY = {
 
 # Keyword rules for classifying web news into event categories (first match wins)
 NEWS_RULES = [
-    ("M&A", r"\b(acquir\w*|acquisition|merg\w*|takeover|buyout|tender offer|to buy|bid for|divest\w*|spin-?off|go(ing)?[- ]private)\b"),
+    ("M&A", r"\b(acquir\w*|acquisition|merg\w*|takeover|buyout|tender offer|to buy|bid for|bidder|divest\w*|spin-?off|"
+            r"go(ing)?[- ]private|take[- ]private|strategic (alternatives|review|options|investment|transaction)|"
+            r"explor\w* (a |the )?sale|weigh\w* (a |the )?sale|consider\w* (a |the )?sale|sale process|for sale|"
+            r"takeover (interest|approach|bid)|approach(ed)? by|unsolicited|hostile|joint venture|carve-?out|"
+            r"asset sale|sells? (its )?\w+ (unit|business|division)|deal talks|in talks to (buy|sell|merge|combine))\b"),
     ("Capital markets", r"\b(ipo|initial public offering|public offering|priced|prices \$|raises? \$|private placement|"
                         r"convertible|senior notes|notes due|share sale|secondary offering|at-the-market|financing round|shelf)\b"),
     ("Activism / ownership", r"\b(activist|stake in|proxy fight|board seats?|13d)\b"),
@@ -52,6 +56,11 @@ NEWS_RULES = [
     ("Earnings / reporting", r"\b(earnings|quarterly results|q[1-4] results|(first|second|third|fourth)[- ]quarter|revenue|guidance|outlook|fiscal (year|quarter))\b"),
     ("Business update", r"\b(partnership|collaborat\w*|launch\w*|contract|agreement with|deal with|unveil\w*)\b"),
 ]
+
+
+RUMOR_RE = re.compile(r"\b(rumou?r\w*|reportedly|people familiar|sources? (said|say|familiar)|said to be|is said to|"
+                      r"in talks|talks to|weighs?|weighing|explor\w*|considering|could|may (sell|buy|merge)|"
+                      r"takeover interest|approached|unsolicited|speculat\w*|according to (a )?report)\b", re.I)
 
 
 def classify_news(title, content=""):
@@ -672,6 +681,157 @@ def debt_securities(filings, cik, email, ids, annual_raw, figi_key, warnings, us
 
 
 # --------------------------------------------------------------------------
+# Board of directors (SEC Forms 3/4/5 and the proxy statement)
+# --------------------------------------------------------------------------
+OWNERSHIP_FORMS = ("3", "4", "5", "3/A", "4/A", "5/A")
+SUFFIXES = {"JR", "JR.", "SR", "SR.", "II", "III", "IV"}
+
+
+def _xml_text(block, tag):
+    m = re.search(rf"<{tag}>\s*(?:<value>)?\s*([^<]*?)\s*(?:</value>)?\s*</{tag}>", block, re.S | re.I)
+    return html.unescape(m.group(1)).strip() if m else ""
+
+
+def _truthy(v):
+    return (v or "").strip().lower() in ("1", "true")
+
+
+def parse_ownership_xml(raw):
+    """Form 3/4/5 XML -> issuer and reporting owners with their relationship to the issuer."""
+    if not raw or "<ownershipDocument" not in raw:
+        return None
+    owners = []
+    for blk in re.findall(r"<reportingOwner>(.*?)</reportingOwner>", raw, re.S | re.I):
+        owners.append({"cik": _xml_text(blk, "rptOwnerCik").zfill(10), "name": _xml_text(blk, "rptOwnerName"),
+                       "director": _truthy(_xml_text(blk, "isDirector")), "officer": _truthy(_xml_text(blk, "isOfficer")),
+                       "title": _xml_text(blk, "officerTitle")})
+    return {"issuer_cik": _xml_text(raw, "issuerCik").zfill(10), "issuer": _xml_text(raw, "issuerName"),
+            "symbol": _xml_text(raw, "issuerTradingSymbol"), "owners": owners}
+
+
+def display_name(edgar_name):
+    """'SMITH JOHN A' -> 'John A. Smith' (EDGAR lists reporting owners last name first)."""
+    toks = [t for t in re.split(r"[\s,]+", edgar_name or "") if t]
+    if len(toks) < 2:
+        return (edgar_name or "").title()
+    suffix = [t for t in toks[1:] if t.upper() in SUFFIXES]
+    rest = [t for t in toks[1:] if t.upper() not in SUFFIXES]
+    fix = lambda t: (t.upper().rstrip(".") + ".") if len(t.rstrip(".")) == 1 else \
+        "-".join("'".join(x.capitalize() for x in part.split("'")) for part in t.split("-"))
+    return " ".join([fix(t) for t in rest] + [fix(toks[0])] + [s.title() for s in suffix])
+
+
+def _ownership_doc(cik, f, email):
+    doc = f["primaryDocument"].split("/")[-1]
+    if not doc.lower().endswith(".xml"):
+        return None
+    raw, _ = src.sec_doc(cik, f["accessionNumber"], doc, email)
+    return parse_ownership_xml(raw)
+
+
+def _proxy_bio(text, name):
+    """Find a director's biography in proxy statement text and return two sentences plus any listed other boards."""
+    parts = name.replace(".", "").split()
+    if len(parts) < 2:
+        return "", ""
+    first, last = re.escape(parts[0]), re.escape(parts[-1] if parts[-1].upper().rstrip(".") not in SUFFIXES else parts[-2])
+    best, best_score = None, 0
+    for m in re.finditer(rf"\b{first}\b(?:\s+[A-Z][a-z]*\.?){{0,2}}\s+{last}\b", text, re.I):
+        after = text[m.end(): m.end() + 40]
+        # A biography normally opens with the name followed by age or a verb: "Jane Doe, 58, has served ..."
+        opener = re.match(r"\s*(,\s*(age\s*)?\d{2}\b|,?\s+(has|is|was|serves|served|joined|brings)\b)", after, re.I)
+        kw = r"\b(has served|director since|served as|experience|previously|chief executive|board of directors|joined)\b"
+        score = (10 if opener else 0) + len(re.findall(kw, text[m.end(): m.end() + 400], re.I))
+        if score > best_score:
+            best, best_score = m, score
+    if not best or best_score < 10:
+        return "", ""
+    chunk = text[best.start(): best.start() + 1200]
+    sentences = split_sentences(chunk)
+    bio = ". ".join(x.rstrip(".") for x in sentences[:2]).strip()
+    bio = (bio[:380].rsplit(" ", 1)[0] + "…") if len(bio) > 380 else bio.rstrip(".") + "."
+    other = re.search(r"(?:other|current)\s+public\s+(?:company\s+)?(?:boards?|directorships?)[^:]{0,40}:\s*([^.]{3,220})",
+                      text[best.start(): best.start() + 3500], re.I)
+    return bio, (other.group(1).strip() if other else "")
+
+
+def board_of_directors(filings, cik, email, company_name, warnings, used, months=18, max_docs=60, max_directors=15):
+    cutoff = (date.today() - timedelta(days=30 * months)).isoformat()
+    owners = {}
+    for f in [f for f in filings if f["form"] in OWNERSHIP_FORMS and f["filingDate"] >= cutoff][:max_docs]:
+        try:
+            d = _ownership_doc(cik, f, email)
+        except src.DataError:
+            continue
+        if not d:
+            continue
+        for o in d["owners"]:
+            if o["cik"].strip("0") and (o["director"] or o["officer"]):
+                cur = owners.setdefault(o["cik"], dict(o, last=f["filingDate"]))
+                cur["director"] |= o["director"]
+                cur["officer"] |= o["officer"]
+                cur["title"] = cur["title"] or o["title"]
+    directors = sorted([o for o in owners.values() if o["director"]], key=lambda o: o["last"], reverse=True)[:max_directors]
+    if not directors:
+        return {"directors": [], "proxy": "", "note": "No director filings (Forms 3/4/5) in the last 18 months. "
+                "Foreign private issuers (40-F/20-F filers) do not file these forms."}
+
+    # Proxy statement for biographies
+    proxy = next((f for f in filings if f["form"] in ("DEF 14A", "DEFA14A") and
+                  f["filingDate"] >= (date.today() - timedelta(days=500)).isoformat()), None)
+    ptext, purl = "", ""
+    if proxy:
+        try:
+            raw, purl = src.sec_doc(cik, proxy["accessionNumber"], proxy["primaryDocument"], email)
+            ptext = html_to_text(raw)
+        except src.DataError:
+            pass
+
+    out = []
+    for o in directors:
+        name = display_name(o["name"])
+        # Other public company roles: issuers in the director's own Form 3/4/5 filings (last 3 years)
+        others = {}
+        try:
+            psub = src.sec_submissions(o["cik"], email)
+            pf = [f for f in _recent(psub) if f["form"] in OWNERSHIP_FORMS and
+                  f["filingDate"] >= (date.today() - timedelta(days=3 * 365)).isoformat()]
+            seen_acc = 0
+            for f in pf[:10]:
+                d = _ownership_doc(o["cik"], f, email)
+                seen_acc += 1
+                if not d or d["issuer_cik"] == cik:
+                    continue
+                me = next((x for x in d["owners"] if x["cik"] == o["cik"]), None)
+                if me and (me["director"] or me["officer"]):
+                    role = ("Director" if me["director"] else "") + (" & " if me["director"] and me["officer"] else "") + \
+                           ((me["title"] or "Officer") if me["officer"] else "")
+                    others.setdefault(d["issuer"].title(), {"role": role, "symbol": d["symbol"]})
+        except src.DataError:
+            pass
+        bio, listed_other = _proxy_bio(ptext, name) if ptext else ("", "")
+        q = requests_quote(f'"{name}" {company_name} board')
+        out.append({
+            "name": name, "cik": o["cik"],
+            "role": "Director" + (f" & {o['title']}" if o["officer"] and o["title"] else (" & Officer" if o["officer"] else "")),
+            "other_public_boards": [f"{k} ({v['symbol']}): {v['role']}" if v["symbol"] else f"{k}: {v['role']}"
+                                    for k, v in others.items()],
+            "proxy_other_boards": listed_other, "bio": bio,
+            "edgar_url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={o['cik']}&type=4&dateb=&owner=include&count=40",
+            "web_url": f"https://www.google.com/search?q={q}",
+            "last_filing": o["last"],
+        })
+    used.add("SEC ownership filings")
+    return {"directors": out, "proxy": f"DEF 14A filed {proxy['filingDate']}" if proxy else "", "proxy_url": purl,
+            "note": "Directors who filed a Form 3, 4 or 5 for this company in the last 18 months."}
+
+
+def requests_quote(text):
+    from urllib.parse import quote_plus
+    return quote_plus(text)
+
+
+# --------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
@@ -734,14 +894,32 @@ def listing_history(history, cik, company, sub=None):
     return out("Unknown", None, "", None)
 
 
+ABBREV = re.compile(r"\b(Dr|Mr|Mrs|Ms|Prof|Inc|Corp|Co|Ltd|Jr|Sr|St|No|Nos|vs|U\.S|Ph\.D|M\.D|e\.g|i\.e)\.", re.I)
+
+
+def split_sentences(text):
+    """Sentence split that does not break on 'Dr.', 'Inc.', 'U.S.' and similar."""
+    t = ABBREV.sub(lambda m: m.group(0).replace(".", "§"), " ".join((text or "").split()))
+    parts = re.split(r"(?<=[a-z0-9\)%§])\.\s+(?=[A-Z])", t)
+    return [p.replace("§", ".") for p in parts if p.strip()]
+
+
+def concise(text, sentences=2, max_chars=300):
+    """First one or two sentences, capped in length."""
+    parts = split_sentences(text)
+    out = ". ".join(p.rstrip(".") for p in parts[:sentences]).strip()
+    out = out if out.endswith(".") else out + "."
+    return out if len(out) <= max_chars else out[:max_chars].rsplit(" ", 1)[0].rstrip(",;") + "…"
+
+
 def web_description(company, tav_key, warnings, used):
     if tav_key:
         try:
-            r = src.tavily(f"What does {company['name']} ({company['industry']}) do? Business overview, main products, "
-                           f"customers and headquarters", tav_key, max_results=5)
+            r = src.tavily(f"In one or two sentences: what does {company['name']} ({company['industry']}) do, "
+                           f"and what are its main products?", tav_key, max_results=5)
             if r["answer"]:
                 used.add("Tavily web search")
-                return {"text": r["answer"], "source": "Web search summary",
+                return {"text": concise(r["answer"]), "source": "Web search summary",
                         "links": [(x["title"], x["url"]) for x in r["results"][:4]]}
         except src.DataError as e:
             warnings.append(f"Web description: {e}")
@@ -749,7 +927,7 @@ def web_description(company, tav_key, warnings, used):
         w = src.wikipedia_summary(company["name"])
         if w:
             used.add("Wikipedia")
-            return {"text": w["text"], "source": f"Wikipedia: {w['title']}", "links": [(w["title"], w["url"])]}
+            return {"text": concise(w["text"]), "source": f"Wikipedia: {w['title']}", "links": [(w["title"], w["url"])]}
     except (src.DataError, ValueError) as e:
         warnings.append(f"Wikipedia: {e}")
     return None
@@ -803,23 +981,31 @@ def is_article(url, title):
     return bool(segs) and (len(segs) >= 2 or len(segs[-1]) >= 20 or "-" in segs[-1])
 
 
+MNA_QUERY_TERMS = ("acquisition OR merger OR takeover OR buyout OR \"strategic alternatives\" OR \"exploring sale\" "
+                   "OR \"in talks\" OR bid OR divestiture OR \"joint venture\"")
+
+
 def web_news(company, ticker, tav_key, warnings, used, days=EVENT_DAYS):
+    """News from the last 90 days; M&A and strategic-transaction stories (including rumors) are fetched separately and listed first."""
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     items = []
+    name = company["name"] + (f" ({ticker})" if ticker else "")
     if tav_key:
-        try:
-            q = f"{company['name']}" + (f" ({ticker})" if ticker else "") + " news"
-            items = src.tavily(q, tav_key, topic="news", days=days, max_results=20, answer=False)["results"]
-            used.add("Tavily web search")
-        except src.DataError as e:
-            warnings.append(f"Web news: {e}")
+        for q in (f"{name} acquisition, merger, takeover, sale process, strategic alternatives or deal talks",
+                  f"{name} news"):
+            try:
+                items += src.tavily(q, tav_key, topic="news", days=days, max_results=15, answer=False)["results"]
+                used.add("Tavily web search")
+            except src.DataError as e:
+                warnings.append(f"Web news: {e}")
+                break
     if not items:
-        try:
-            items = src.gdelt_news(src.clean_name(company["name"]))
-            if items:
+        for extra in (f"({MNA_QUERY_TERMS.replace(chr(92), '')})", ""):
+            try:
+                items += src.gdelt_news(src.clean_name(company["name"]), max_records=50 if extra else 75, extra=extra)
                 used.add("GDELT news")
-        except src.DataError as e:
-            warnings.append(f"GDELT news: {e}")
+            except src.DataError as e:
+                warnings.append(f"GDELT news: {e}")
     out, seen = [], set()
     for it in items:
         d = _norm_date(it["date"])
@@ -829,8 +1015,12 @@ def web_news(company, ticker, tav_key, warnings, used, days=EVENT_DAYS):
         if not it["title"] or key in seen or not is_article(it["url"], it["title"]):
             continue
         seen.add(key)
-        out.append(dict(it, date=d or ""))
-    return sorted(out, key=lambda x: x["date"], reverse=True)
+        cat = classify_news(it["title"], it.get("content", ""))
+        rumored = cat == "M&A" and bool(RUMOR_RE.search(f"{it['title']} {it.get('content', '')}"))
+        out.append(dict(it, date=d or "", category=cat or "", mna=cat == "M&A", rumored=rumored))
+    # M&A / strategic first (newest first), then everything else (newest first)
+    out.sort(key=lambda x: x["date"], reverse=True)
+    return sorted(out, key=lambda x: not x["mna"])
 
 
 def _norm_date(s):
@@ -853,7 +1043,8 @@ def web_events(news):
     for n in news:
         cat = classify_news(n["title"], n.get("content", ""))
         if cat and n["date"]:                    # undated items stay in the news list only
-            out.append({"date": n["date"], "status": "Reported", "category": cat, "form": n["source"] or "Web",
+            out.append({"date": n["date"], "status": "Rumored" if n.get("rumored") else "Reported", "category": cat,
+                        "form": n["source"] or "Web",
                         "title": n["title"], "why": WHY[cat], "url": n["url"]})
     return out
 
@@ -1027,7 +1218,7 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
     if web_desc:
         description = {"text": web_desc["text"], "source": web_desc["source"], "links": web_desc["links"]}
     elif filing_desc:
-        description = {"text": filing_desc, "source": desc_src, "links": []}
+        description = {"text": concise(filing_desc), "source": desc_src, "links": []}
     else:
         description = {"text": "", "source": "", "links": []}
         warnings.append("No business description found from web search, Wikipedia or the annual report.")
@@ -1060,6 +1251,10 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
                  {"bonds": [], "matured_excluded": 0, "documents_read": 0}, warnings)
     debt["total_debt"] = bs.get("debt")
 
+    progress("Board of directors")
+    board = _safe("Board of directors", lambda: board_of_directors(filings, cik, email, company["name"], warnings, used),
+                  {"directors": [], "proxy": "", "note": ""}, warnings)
+
     progress("Market data")
     if av_key or td_key:
         market = _safe("Market data", lambda: market_data(company, securities, bs, settings, warnings),
@@ -1082,12 +1277,13 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
                         "and fuller news. News falls back to GDELT.")
     events = sorted(_safe("Corporate events", lambda: corporate_events(filings, cik), [], warnings) +
                     _safe("Web events", lambda: web_events(news), [], warnings), key=lambda e: e["date"], reverse=True)
+    events.sort(key=lambda e: e["category"] != "M&A")      # M&A and strategic transactions first
 
     profile = {
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "company": company, "cover": flags, "financials": bs, "market": market,
         "description": description, "filing_excerpt": filing_desc, "filing_excerpt_source": desc_src,
-        "listing": listing, "identifiers": ids, "debt": debt,
+        "listing": listing, "identifiers": ids, "debt": debt, "board": board,
         "securities": securities, "holders": holders, "events": events, "news": news[:25],
         "filings": filings, "warnings": warnings, "sources": sorted(used),
     }

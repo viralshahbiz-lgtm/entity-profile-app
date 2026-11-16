@@ -1,16 +1,18 @@
 # Entity Profile: U.S. and Canadian Technology and Biotech companies
 
-A simple web page. Start typing a company name or ticker, pick a match, and the page pulls together public information:
+A simple web page. Start typing a company name or ticker, pick a match, and the page shows, in this order:
 
-- **Market data (prior close):** the last completed session's close with 1-day and 1-month change, 52-week range, market cap, enterprise value, public float, shares outstanding, average daily volume and worldwide ADTV.
-- **Business description:** a short summary written from web search results, with a Wikipedia or annual report fallback.
-- **How and when it went public:** one line, either the IPO date, or that it went public by merging with a SPAC / blank-check company (with the SPAC's name and completion date). Spin-offs, direct listings and Canadian cross-listings get a one-line label too.
-- **Security identifiers:** tickers on every listing, ISIN, CUSIP, FIGI, composite and share-class FIGI, LEI and CIK. Debt ISINs mapped to the issuer are listed separately.
-- **Debt securities:** outstanding notes, bonds and convertibles with coupon, maturity, size, CUSIP/ISIN/FIGI and exchange listing (matured issues hidden), plus total debt from the balance sheet.
-- **Significant holders:** 5%+ holders from Schedule 13D and 13G filings.
-- **Corporate events and news, last 90 days:** from SEC filings and from web news search, sorted into categories (M&A, capital markets, management, regulatory/clinical, legal, earnings and others). Estimated upcoming dates are included.
-- **Research safe harbor summary:** Rule 139, JOBS Act EGC research and FINRA 2241 quiet periods, with the key facts behind them (EGC status, Reg M actively traded, ADTV, float).
-- **Export PDF:** a one- to two-page summary.
+1. **Company description:** one or two sentences from web search, with Wikipedia or the annual report as fallbacks.
+2. **Market data (prior close):** last completed session's close, 1-day and 1-month change, a colour bar showing where the price sits in its 52-week range, plus market cap, enterprise value, float, shares outstanding, average volume and ADTV.
+3. **Equity securities and identifiers:** tickers, ISIN, CUSIP, FIGIs, LEI and CIK. SEDOL is licensed and shown as unavailable.
+4. **Fixed income securities:** outstanding notes, bonds and convertibles with coupon, maturity, amount, CUSIP/ISIN and exchange listing, plus total debt.
+5. **How and when it went public:** one line, either the IPO date or that it merged with a SPAC / blank-check company.
+6. **Significant holders:** 5%+ holders from Schedule 13D and 13G filings.
+7. **News and corporate events, last 90 days:** M&A and strategic-transaction stories come first in a highlighted box, including rumored deals (marked RUMORED), then all other news. Every headline links to the article itself.
+8. **Research safe harbor summary:** Rule 139, JOBS Act EGC research and FINRA 2241 quiet periods.
+9. **Board of directors:** each director with a two-sentence biography from the latest proxy statement, other public company roles (from their own SEC ownership filings), and links to their SEC filings and a web profile search.
+
+There's also **Export PDF**, a one- to two-page summary in the same order with clickable links.
 
 It runs free on **Streamlit Community Cloud**, a hosting service for small Python web apps. Setup takes about 30 minutes, all in a web browser.
 
@@ -30,6 +32,7 @@ It runs free on **Streamlit Community Cloud**, a hosting service for small Pytho
 | TSX listing and prices; backup for U.S. prices | Alpha Vantage | Free key: 25 calls a day |
 | Debt securities | SEC offering documents (last 3 years), GLEIF debt ISINs described through OpenFIGI, exchange-listed notes on the 10-K cover | No |
 | Security names on U.S. exchanges | Nasdaq Trader symbol directory | No |
+| Board of directors | SEC Forms 3/4/5 (who is a director, and their roles at other public companies) and the latest DEF 14A proxy statement (biographies) | No |
 
 **Identifiers and their limits:**
 - **CUSIPs:** U.S. and Canadian CUSIPs are characters 3–11 of the ISIN. CUSIPs reported on 13D/13G cover pages fill gaps.
@@ -132,6 +135,8 @@ It refreshes itself every Sunday.
 | Debt securities shows none | Many tech and biotech companies have no public bonds. Older debt appears only if GLEIF maps its ISIN to the company or it is exchange-listed. |
 | LEI shows "not found" | GLEIF had no exact name match in the U.S. or Canada. Identifiers from tickers (FIGI) still appear. |
 | ISIN or CUSIP blank for a security | GLEIF has no ISIN mapped for that line yet; CUSIPs from 13D/13G filings are used when available. |
+| Board of directors is empty | Foreign private issuers (Canadian 40-F filers) don't file Forms 3/4/5 or U.S. proxy statements. For U.S. filers, only directors with an ownership filing in the last 18 months are listed. |
+| A director has no biography | The proxy statement didn't use a standard "Name, age, has served..." layout; use the SEC filings or web profile links. |
 | "IPO date not found" | The company listed before electronic SEC filing and web search found no date. |
 | "Could not reach …" | That service was busy. Pick the company again in a minute. |
 

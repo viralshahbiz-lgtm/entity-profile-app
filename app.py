@@ -145,6 +145,35 @@ if not p:
 # ---------------------------------------------------------------- profile
 c, m, r, ids, lst = p["company"], p["market"], p["regm"], p["identifiers"], p["listing"]
 pv = m.get("primary") or {}
+
+
+def range_bar(v):
+    """Visual: where the prior close sits inside the 52-week range."""
+    lo, hi, px = v.get("low_52w"), v.get("high_52w"), v.get("price")
+    if lo is None or hi is None or px is None or hi <= lo:
+        return ""
+    pos = max(0.0, min(1.0, (px - lo) / (hi - lo))) * 100
+    off_hi, off_lo = (px / hi - 1) * 100, (px / lo - 1) * 100
+    ccy = v.get("currency", "")
+    return f"""
+<div style="margin:6px 0 14px 0;font-family:sans-serif">
+  <div style="display:flex;justify-content:space-between;font-size:0.8em;color:#5d6878">
+    <span>{v.get('exchange', '')} · 52-week range</span><span>{pos:.0f}% of range · {off_hi:+.1f}% vs high · {off_lo:+.1f}% vs low</span>
+  </div>
+  <div style="position:relative;height:14px;margin:6px 0 4px 0;border-radius:7px;
+              background:linear-gradient(90deg,#c0392b 0%,#e6b33c 50%,#1d7a4c 100%);opacity:0.85"></div>
+  <div style="position:relative;height:0">
+    <div style="position:absolute;left:calc({pos:.1f}% - 9px);top:-22px;width:18px;height:18px;border-radius:50%;
+                background:#16202e;border:3px solid white;box-shadow:0 0 3px rgba(0,0,0,.5)"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;font-size:0.85em;margin-top:4px">
+    <span>Low <b>{ccy} {lo:,.2f}</b> <span style="color:#5d6878">(wk {v.get('low_52w_week', '')})</span></span>
+    <span>Prior close <b>{ccy} {px:,.2f}</b></span>
+    <span>High <b>{ccy} {hi:,.2f}</b> <span style="color:#5d6878">(wk {v.get('high_52w_week', '')})</span></span>
+  </div>
+</div>"""
+
+
 head, btn = st.columns([4, 1])
 with head:
     st.header(c["name"])
@@ -160,7 +189,14 @@ if p["warnings"]:
         for w in p["warnings"]:
             st.write("• " + w)
 
-# Market data
+# 1. Company description
+st.subheader("Company description")
+d = p["description"]
+st.write(d["text"] or "_Not available._")
+if d["source"]:
+    st.caption(f"Source: {d['source']}" + (f" · {links_md(d['links'][:2])}" if d["links"] else ""))
+
+# 2. Market data
 st.subheader("Market data")
 ccy = pv.get("currency", "")
 cols = st.columns(4)
@@ -172,36 +208,20 @@ cols[0].metric(f"Prior close{' (' + pv['price_date'] + ')' if pv.get('price_date
 cols[1].metric("Market cap", money(m.get("market_cap"), m.get("market_cap_ccy", "")))
 cols[2].metric("Enterprise value", money(m.get("enterprise_value"), ccy),
                help=f"Cash {money(m.get('cash'), ccy)}, debt {money(m.get('debt'), ccy)}" if m.get("enterprise_value") is not None else None)
-cols[3].metric("52-week range", f"{money(pv.get('low_52w'))} – {money(pv.get('high_52w'))}" if pv.get("high_52w") else "n/a")
+cols[3].metric("1-month change", f"{pv['change_1m_pct']:+.1f}%" if pv.get("change_1m_pct") is not None else "n/a")
+for v in m.get("venues", []):
+    bar = range_bar(v)
+    if bar:
+        st.markdown(bar, unsafe_allow_html=True)
 cols = st.columns(4)
 cols[0].metric("Public float (reported)", money(m.get("public_float_usd"), "US$"),
                help=f"Annual report cover, as of {m.get('public_float_date', '')}")
 cols[1].metric("Shares outstanding", f"{m['shares_out']:,.0f}" if m.get("shares_out") else "n/a")
 cols[2].metric("Avg daily volume (60d)", f"{m['adv_shares_total']:,.0f}" if m.get("adv_shares_total") else "n/a")
 cols[3].metric("ADTV worldwide (60d)", money(m.get("adtv_usd"), "US$"))
-if len(m.get("venues", [])) > 1:
-    st.caption("Other listings: " + " · ".join(f"{v['exchange']} prior close {money(v['price'], v['currency'])} ({v['price_date']})"
-                                               for v in m["venues"][1:]))
 
-# Business description
-st.subheader("Business description")
-d = p["description"]
-st.write(d["text"] or "_Not available._")
-if d["source"]:
-    st.caption(f"Source: {d['source']}" + (f" · {links_md(d['links'])}" if d["links"] else ""))
-if p.get("filing_excerpt") and d["source"] != p.get("filing_excerpt_source"):
-    with st.expander(f"Excerpt from the annual report ({p['filing_excerpt_source']})"):
-        st.write(p["filing_excerpt"])
-
-# How and when it went public
-st.subheader("How and when it went public")
-if lst.get("summary"):
-    st.markdown(f"**{lst['summary']}**" + (f"  [source]({lst['link']})" if lst.get("link") else ""))
-else:
-    st.caption("Not available.")
-
-# Identifiers
-st.subheader("Security identifiers")
+# 3. Equity securities and identifiers
+st.subheader("Equity securities and identifiers")
 e = ids["entity"]
 st.write(f"**CIK** {e['CIK']} · **LEI** {e['LEI'] or 'not found'}" + (f" ({e['LEI status']})" if e.get("LEI status") else "")
          + (f" · **EIN** {e['EIN']}" if e.get("EIN") else ""))
@@ -210,16 +230,12 @@ if ids["securities"]:
                                 "CUSIP": x["cusip"], "FIGI": x["figi"], "Composite FIGI": x["composite_figi"],
                                 "Share class FIGI": x["share_class_figi"], "SEDOL": x["sedol"]} for x in ids["securities"]]),
                  hide_index=True, use_container_width=True)
-if ids["debt"]:
-    with st.expander(f"Debt and other ISINs mapped to this issuer ({len(ids['debt'])})"):
-        st.dataframe(pd.DataFrame(ids["debt"]).rename(columns={"isin": "ISIN", "cusip": "CUSIP"}),
-                     hide_index=True, use_container_width=True)
 for n in ids["notes"]:
     st.caption(n)
 
-# Debt securities
+# 4. Fixed income
 dbt = p.get("debt") or {"bonds": []}
-st.subheader(f"Debt securities ({len(dbt['bonds'])} outstanding)")
+st.subheader(f"Fixed income securities ({len(dbt['bonds'])} outstanding)")
 td = dbt.get("total_debt")
 st.caption((f"Total debt on the balance sheet: {money(td['value'], td['unit'])} as of {td['date']} (SEC XBRL). " if td else "")
            + f"Searched {dbt.get('documents_read', 0)} recent offering documents, the issuer's GLEIF-mapped ISINs and the "
@@ -231,11 +247,18 @@ if dbt["bonds"]:
                                 "Source": ", ".join(b["sources"]), "Document": b["link"]} for b in dbt["bonds"]]),
                  hide_index=True, use_container_width=True,
                  column_config={"Document": st.column_config.LinkColumn(display_text="open")})
-    st.caption("Trade prices for corporate bonds are reported to FINRA TRACE; search by CUSIP at finra.org (Fixed Income Data).")
+    st.caption("Corporate bond trade prices are reported to FINRA TRACE; search by CUSIP at finra.org (Fixed Income Data).")
 else:
     st.caption("No publicly issued notes or bonds found. Bank loans and private placements are not public securities.")
 
-# Holders
+# 5. How and when it went public
+st.subheader("How and when it went public")
+if lst.get("summary"):
+    st.markdown(f"**{lst['summary']}**" + (f"  [source]({lst['link']})" if lst.get("link") else ""))
+else:
+    st.caption("Not available.")
+
+# 6. Holders
 st.subheader("Significant holders (5%+)")
 if p["holders"]:
     st.dataframe(pd.DataFrame([{"Holder": h["name"], "% of class": h["pct"], "Form": h["form"], "Filed": h["date"]}
@@ -245,9 +268,24 @@ if p["holders"]:
 else:
     st.caption("No Schedule 13D/13G filings in the last three years.")
 
-# Events and news
-st.subheader("Corporate events and news (last 90 days)")
-tab_ev, tab_news = st.tabs([f"Events ({len(p['events'])})", f"News ({len(p['news'])})"])
+# 7. News and events: M&A and strategic transactions first
+st.subheader("News and corporate events (last 90 days)")
+mna = [n for n in p["news"] if n.get("mna")]
+if mna:
+    with st.container(border=True):
+        st.markdown("#### 🔶 M&A and strategic transactions")
+        for n in mna:
+            tag = "🟠 **RUMORED** · " if n.get("rumored") else "🔴 **REPORTED** · "
+            st.markdown(f"{tag}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
+else:
+    st.caption("No M&A or strategic-transaction news found in the last 90 days.")
+tab_news, tab_ev = st.tabs([f"All news ({len(p['news'])})", f"Corporate events ({len(p['events'])})"])
+with tab_news:
+    for n in p["news"]:
+        badge = ("🟠 Rumored M&A · " if n.get("rumored") else "🔴 M&A · ") if n.get("mna") else ""
+        st.markdown(f"{badge}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
+    if not p["news"]:
+        st.caption("No news found in the last 90 days.")
 with tab_ev:
     if p["events"]:
         cats = sorted({x["category"] for x in p["events"]})
@@ -257,18 +295,11 @@ with tab_ev:
                                    for x in p["events"] if x["category"] in chosen]),
                      hide_index=True, use_container_width=True,
                      column_config={"Link": st.column_config.LinkColumn(display_text="open")})
-        st.caption("Filed = SEC filing · Reported = found in web news · Estimated = worked out from filing history.")
+        st.caption("M&A first. Filed = SEC filing · Reported / Rumored = web news · Estimated = worked out from filing history.")
     else:
         st.caption("No events found in the last 90 days.")
-with tab_news:
-    if p["news"]:
-        for n in p["news"]:
-            st.markdown(f"**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_  \n"
-                        f"<span style='font-size:0.8em;color:gray'>{n['url']}</span>", unsafe_allow_html=True)
-    else:
-        st.caption("No news found in the last 90 days.")
 
-# Safe harbor summary
+# 8. Safe harbor summary
 st.subheader("Research safe harbor summary")
 st.info(r["summary"])
 if r.get("facts"):
@@ -277,5 +308,20 @@ if r.get("facts"):
         col.metric(lab, val)
 if r.get("harbors"):
     st.dataframe(pd.DataFrame(r["harbors"], columns=["Safe harbor", "Status", "Basis"]), hide_index=True, use_container_width=True)
+
+# 9. Board of directors
+bd = p.get("board") or {"directors": []}
+st.subheader(f"Board of directors ({len(bd['directors'])})")
+if bd["directors"]:
+    st.caption(bd.get("note", "") + (f" Biographies from the {bd['proxy']}." if bd.get("proxy") else ""))
+    for x in bd["directors"]:
+        others = x["other_public_boards"] or ([x["proxy_other_boards"]] if x.get("proxy_other_boards") else [])
+        with st.container(border=True):
+            st.markdown(f"**{x['name']}** · {x['role']}  ·  [SEC filings]({x['edgar_url']}) · [Web profile search]({x['web_url']})")
+            if x["bio"]:
+                st.write(x["bio"])
+            st.caption("Other public company affiliations: " + ("; ".join(others) if others else "none found in SEC filings"))
+else:
+    st.caption(bd.get("note") or "Board information not available.")
 st.divider()
 st.caption("Sources: " + ", ".join(p["sources"]) + ". Public data only; not investment or legal advice.")
