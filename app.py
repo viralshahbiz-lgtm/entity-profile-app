@@ -15,7 +15,7 @@ import pandas as pd
 import streamlit as st
 
 import sources as src
-from entity_profile import build_profile
+from entity_profile import (build_base, ensure, section_data, to_profile, SECTIONS, USER_SECTIONS)
 from pdf_report import make_pdf
 
 st.set_page_config(page_title="Entity Profile", page_icon="📇", layout="wide")
@@ -57,9 +57,31 @@ def load_universe():
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def cached_profile(cik, settings_items):
+def cached_base(cik, settings_items):
+    """Fast first view: company record, description and market data."""
     settings = dict(settings_items)
-    return build_profile(cik, settings, load_sec_tickers(settings["SEC_CONTACT_EMAIL"]), load_symbol_directory())
+    return build_base(cik, settings, load_sec_tickers(settings["SEC_CONTACT_EMAIL"]), load_symbol_directory())
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def cached_section(cik, name, settings_items, _ctx):
+    """One optional section, loaded only when asked for; results are shared for 6 hours."""
+    ensure(_ctx, name)
+    out = section_data(_ctx, name)
+    for dep in SECTIONS[name][1]:                    # keep dependencies too, so later sections can reuse them
+        out.update(section_data(_ctx, dep))
+    return out
+
+
+def load_section(ctx, name):
+    if name in ctx["loaded"]:
+        return
+    data = cached_section(ctx["cik"], name, tuple(sorted(SETTINGS.items())), ctx)
+    ctx.update(data)
+    ctx["loaded"].add(name)
+    for dep in SECTIONS[name][1]:
+        if all(k in ctx for k in section_data(ctx, dep)) and section_data(ctx, dep):
+            ctx["loaded"].add(dep)
 
 
 @st.cache_data(show_spinner=False)
@@ -122,29 +144,26 @@ pick = st.selectbox("Company", sorted(options, key=str.lower), index=None,
 if pick:
     cik = options[pick]
     if st.session_state.get("cik") != cik:
-        with st.status("Gathering public data…", expanded=False) as status:
+        with st.status("Loading company profile and market data…", expanded=False) as status:
             try:
-                st.session_state["profile"] = cached_profile(cik, tuple(sorted(SETTINGS.items())))
+                st.session_state["ctx"] = cached_base(cik, tuple(sorted(SETTINGS.items())))
                 st.session_state["cik"] = cik
+                st.session_state.pop("pdf_ready", None)
                 status.update(label="Done", state="complete")
             except src.DataError as e:
                 status.update(label="Could not build the profile", state="error")
                 st.error(str(e))
 
-p = st.session_state.get("profile")
-if not p:
-    st.write("Type a company name or ticker above. Matches appear as you type. Each profile shows market data, "
-             "a business description summary, how and when the company went public, security identifiers, "
-             "5%+ holders, corporate events and news from the last 90 days, and a research safe harbor summary. "
-             "Any profile can be exported as a one- to two-page PDF.")
+ctx = st.session_state.get("ctx")
+if not ctx:
+    st.write("Type a company name or ticker above. Matches appear as you type. The profile opens with the company "
+             "description and market data; add more sections (identifiers, fixed income, IPO history, holders, news and "
+             "events, safe harbor summary, board of directors) only when you need them. The PDF export always includes "
+             "every section.")
     if not len(uni):
         st.info("The Technology and Biotech list has not been built yet (README, step 5). "
                 "Until then, every SEC-listed company is searchable.")
     st.stop()
-
-# ---------------------------------------------------------------- profile
-c, m, r, ids, lst = p["company"], p["market"], p["regm"], p["identifiers"], p["listing"]
-pv = m.get("primary") or {}
 
 
 def range_bar(v):
@@ -174,37 +193,64 @@ def range_bar(v):
 </div>"""
 
 
+# ---------------------------------------------------------------- choose extra sections
+c = ctx["company"]
 head, btn = st.columns([4, 1])
 with head:
     st.header(c["name"])
-    commons = ", ".join(f"{s['ticker']} ({s['exchange']})" for s in p["securities"] if s["type"] == "Common Stock")
+    commons = ", ".join(f"{x['ticker']} ({x['exchange']})" for x in ctx["securities"] if x["type"] == "Common Stock")
     st.caption(f"{commons} · {c['sector']} · {c['industry']} · HQ {', '.join(x for x in (c['hq_city'], c['hq_country']) if x)} "
-               f"· Incorporated {c['incorporation']} · as of {p['as_of']}")
+               f"· Incorporated {c['incorporation']} · as of {ctx['as_of']}")
 with btn:
-    st.download_button("⬇ Export PDF summary", data=cached_pdf(c["cik"], p["as_of"], p),
-                       file_name=f"{(commons.split(' ')[0] or c['cik'])}_entity_profile.pdf",
-                       mime="application/pdf", use_container_width=True, type="primary")
+    # The PDF always holds every section, so loading them is done only when the user asks for the PDF
+    if st.session_state.get("pdf_ready") == ctx["cik"]:
+        full = to_profile(ctx)
+        st.download_button("⬇ Download full PDF", data=cached_pdf(c["cik"], ctx["as_of"], full),
+                           file_name=f"{(commons.split(' ')[0] or c['cik'])}_entity_profile.pdf",
+                           mime="application/pdf", use_container_width=True, type="primary")
+    elif st.button("📄 Prepare full PDF", use_container_width=True, help="Loads every section, then offers the PDF"):
+        with st.status("Loading every section for the PDF…") as status:
+            for name in USER_SECTIONS:
+                status.update(label=f"Loading {SECTIONS[name][0].lower()}…")
+                load_section(ctx, name)
+            status.update(label="PDF ready", state="complete")
+        st.session_state["pdf_ready"] = ctx["cik"]
+        st.rerun()
+
+st.markdown("**Add sections** (each loads only when ticked):")
+picked = []
+cols = st.columns(4)
+for k, name in enumerate(USER_SECTIONS):
+    with cols[k % 4]:
+        if st.checkbox(SECTIONS[name][0], key=f"sec_{name}", value=name in ctx["loaded"]):
+            picked.append(name)
+for name in picked:
+    if name not in ctx["loaded"]:
+        with st.spinner(f"Loading {SECTIONS[name][0].lower()}…"):
+            load_section(ctx, name)
+
+p = to_profile(ctx)
+m, r, ids, lst = p["market"], p["regm"], p["identifiers"], p["listing"]
+pv = m.get("primary") or {}
 if p["warnings"]:
     with st.expander(f"Data notes ({len(p['warnings'])})"):
-        for w in p["warnings"]:
+        for w in dict.fromkeys(p["warnings"]):
             st.write("• " + w)
 
-# 1. Company description
+# ---------------------------------------------------------------- always shown: description and market data
 st.subheader("Company description")
 d = p["description"]
 st.write(d["text"] or "_Not available._")
 if d["source"]:
     st.caption(f"Source: {d['source']}" + (f" · {links_md(d['links'][:2])}" if d["links"] else ""))
 
-# 2. Market data
 st.subheader("Market data")
 ccy = pv.get("currency", "")
 cols = st.columns(4)
 cols[0].metric(f"Prior close{' (' + pv['price_date'] + ')' if pv.get('price_date') else ''}",
                money(pv.get("price"), ccy) if pv else "n/a",
                f"{pv['change_1d_pct']:+.2f}% on the day" if pv.get("change_1d_pct") is not None else None,
-               help=f"{pv.get('exchange', '')} close from {pv.get('provider', '')}. 1-month change: "
-                    + (f"{pv['change_1m_pct']:+.1f}%" if pv.get("change_1m_pct") is not None else "n/a"))
+               help=f"{pv.get('exchange', '')} close from {pv.get('provider', '')}")
 cols[1].metric("Market cap", money(m.get("market_cap"), m.get("market_cap_ccy", "")))
 cols[2].metric("Enterprise value", money(m.get("enterprise_value"), ccy),
                help=f"Cash {money(m.get('cash'), ccy)}, debt {money(m.get('debt'), ccy)}" if m.get("enterprise_value") is not None else None)
@@ -220,108 +266,111 @@ cols[1].metric("Shares outstanding", f"{m['shares_out']:,.0f}" if m.get("shares_
 cols[2].metric("Avg daily volume (60d)", f"{m['adv_shares_total']:,.0f}" if m.get("adv_shares_total") else "n/a")
 cols[3].metric("ADTV worldwide (60d)", money(m.get("adtv_usd"), "US$"))
 
-# 3. Equity securities and identifiers
-st.subheader("Equity securities and identifiers")
-e = ids["entity"]
-st.write(f"**CIK** {e['CIK']} · **LEI** {e['LEI'] or 'not found'}" + (f" ({e['LEI status']})" if e.get("LEI status") else "")
-         + (f" · **EIN** {e['EIN']}" if e.get("EIN") else ""))
-if ids["securities"]:
-    st.dataframe(pd.DataFrame([{"Ticker": x["ticker"], "Exchange": x["exchange"], "Type": x["type"], "ISIN": x["isin"],
-                                "CUSIP": x["cusip"], "FIGI": x["figi"], "Composite FIGI": x["composite_figi"],
-                                "Share class FIGI": x["share_class_figi"], "SEDOL": x["sedol"]} for x in ids["securities"]]),
-                 hide_index=True, use_container_width=True)
-for n in ids["notes"]:
-    st.caption(n)
+# ---------------------------------------------------------------- optional sections, in a fixed order
+if "identifiers" in picked:
+    st.subheader("Equity securities and identifiers")
+    e = ids["entity"]
+    st.write(f"**CIK** {e['CIK'] or c['cik']} · **LEI** {e['LEI'] or 'not found'}" + (f" ({e['LEI status']})" if e.get("LEI status") else "")
+             + (f" · **EIN** {e['EIN']}" if e.get("EIN") else ""))
+    if ids["securities"]:
+        st.dataframe(pd.DataFrame([{"Ticker": x["ticker"], "Exchange": x["exchange"], "Type": x["type"], "ISIN": x["isin"],
+                                    "CUSIP": x["cusip"], "FIGI": x["figi"], "Composite FIGI": x["composite_figi"],
+                                    "Share class FIGI": x["share_class_figi"], "SEDOL": x["sedol"]} for x in ids["securities"]]),
+                     hide_index=True, use_container_width=True)
+    for n in ids["notes"]:
+        st.caption(n)
 
-# 4. Fixed income
-dbt = p.get("debt") or {"bonds": []}
-st.subheader(f"Fixed income securities ({len(dbt['bonds'])} outstanding)")
-td = dbt.get("total_debt")
-st.caption((f"Total debt on the balance sheet: {money(td['value'], td['unit'])} as of {td['date']} (SEC XBRL). " if td else "")
-           + f"Searched {dbt.get('documents_read', 0)} recent offering documents, the issuer's GLEIF-mapped ISINs and the "
-             "annual report cover." + (f" {dbt['matured_excluded']} matured issues hidden." if dbt.get("matured_excluded") else ""))
-if dbt["bonds"]:
-    st.dataframe(pd.DataFrame([{"Security": b["description"], "Coupon": (b["coupon"] + "%") if b["coupon"] and b["coupon"] != "Floating" else b["coupon"],
-                                "Maturity": b["maturity"], "Amount": money(b["principal"], "US$") if b["principal"] else "",
-                                "CUSIP": b["cusip"], "ISIN": b["isin"], "FIGI": b["figi"], "Exchange-listed": b["listed"],
-                                "Source": ", ".join(b["sources"]), "Document": b["link"]} for b in dbt["bonds"]]),
-                 hide_index=True, use_container_width=True,
-                 column_config={"Document": st.column_config.LinkColumn(display_text="open")})
-    st.caption("Corporate bond trade prices are reported to FINRA TRACE; search by CUSIP at finra.org (Fixed Income Data).")
-else:
-    st.caption("No publicly issued notes or bonds found. Bank loans and private placements are not public securities.")
-
-# 5. How and when it went public
-st.subheader("How and when it went public")
-if lst.get("summary"):
-    st.markdown(f"**{lst['summary']}**" + (f"  [source]({lst['link']})" if lst.get("link") else ""))
-else:
-    st.caption("Not available.")
-
-# 6. Holders
-st.subheader("Significant holders (5%+)")
-if p["holders"]:
-    st.dataframe(pd.DataFrame([{"Holder": h["name"], "% of class": h["pct"], "Form": h["form"], "Filed": h["date"]}
-                               for h in p["holders"]]), hide_index=True, use_container_width=True,
-                 column_config={"% of class": st.column_config.ProgressColumn(
-                     format="%.1f%%", min_value=0, max_value=max(10, max((h["pct"] or 0) for h in p["holders"])))})
-else:
-    st.caption("No Schedule 13D/13G filings in the last three years.")
-
-# 7. News and events: M&A and strategic transactions first
-st.subheader("News and corporate events (last 90 days)")
-mna = [n for n in p["news"] if n.get("mna")]
-if mna:
-    with st.container(border=True):
-        st.markdown("#### 🔶 M&A and strategic transactions")
-        for n in mna:
-            tag = "🟠 **RUMORED** · " if n.get("rumored") else "🔴 **REPORTED** · "
-            st.markdown(f"{tag}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
-else:
-    st.caption("No M&A or strategic-transaction news found in the last 90 days.")
-tab_news, tab_ev = st.tabs([f"All news ({len(p['news'])})", f"Corporate events ({len(p['events'])})"])
-with tab_news:
-    for n in p["news"]:
-        badge = ("🟠 Rumored M&A · " if n.get("rumored") else "🔴 M&A · ") if n.get("mna") else ""
-        st.markdown(f"{badge}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
-    if not p["news"]:
-        st.caption("No news found in the last 90 days.")
-with tab_ev:
-    if p["events"]:
-        cats = sorted({x["category"] for x in p["events"]})
-        chosen = st.multiselect("Category", cats, default=cats, key="evcats")
-        st.dataframe(pd.DataFrame([{"Date": x["date"], "Category": x["category"], "Event": x["title"],
-                                    "Status": x["status"], "Source": x["form"], "Link": x["url"]}
-                                   for x in p["events"] if x["category"] in chosen]),
+if "debt" in picked:
+    dbt = p["debt"]
+    st.subheader(f"Fixed income securities ({len(dbt['bonds'])} outstanding)")
+    td = dbt.get("total_debt")
+    st.caption((f"Total debt on the balance sheet: {money(td['value'], td['unit'])} as of {td['date']} (SEC XBRL). " if td else "")
+               + f"Searched {dbt.get('documents_read', 0)} recent offering documents, the issuer's GLEIF-mapped ISINs and the "
+                 "annual report cover." + (f" {dbt['matured_excluded']} matured issues hidden." if dbt.get("matured_excluded") else ""))
+    if dbt["bonds"]:
+        st.dataframe(pd.DataFrame([{"Security": b["description"],
+                                    "Coupon": (b["coupon"] + "%") if b["coupon"] and b["coupon"] != "Floating" else b["coupon"],
+                                    "Maturity": b["maturity"], "Amount": money(b["principal"], "US$") if b["principal"] else "",
+                                    "CUSIP": b["cusip"], "ISIN": b["isin"], "FIGI": b["figi"], "Exchange-listed": b["listed"],
+                                    "Source": ", ".join(b["sources"]), "Document": b["link"]} for b in dbt["bonds"]]),
                      hide_index=True, use_container_width=True,
-                     column_config={"Link": st.column_config.LinkColumn(display_text="open")})
-        st.caption("M&A first. Filed = SEC filing · Reported / Rumored = web news · Estimated = worked out from filing history.")
+                     column_config={"Document": st.column_config.LinkColumn(display_text="open")})
+        st.caption("Corporate bond trade prices are reported to FINRA TRACE; search by CUSIP at finra.org (Fixed Income Data).")
     else:
-        st.caption("No events found in the last 90 days.")
+        st.caption("No publicly issued notes or bonds found. Bank loans and private placements are not public securities.")
 
-# 8. Safe harbor summary
-st.subheader("Research safe harbor summary")
-st.info(r["summary"])
-if r.get("facts"):
-    fc = st.columns(len(r["facts"]))
-    for col, (lab, val) in zip(fc, r["facts"]):
-        col.metric(lab, val)
-if r.get("harbors"):
-    st.dataframe(pd.DataFrame(r["harbors"], columns=["Safe harbor", "Status", "Basis"]), hide_index=True, use_container_width=True)
+if "listing" in picked:
+    st.subheader("How and when it went public")
+    if lst.get("summary"):
+        st.markdown(f"**{lst['summary']}**" + (f"  [source]({lst['link']})" if lst.get("link") else ""))
+    else:
+        st.caption("Not available.")
 
-# 9. Board of directors
-bd = p.get("board") or {"directors": []}
-st.subheader(f"Board of directors ({len(bd['directors'])})")
-if bd["directors"]:
-    st.caption(bd.get("note", "") + (f" Biographies from the {bd['proxy']}." if bd.get("proxy") else ""))
-    for x in bd["directors"]:
-        others = x["other_public_boards"] or ([x["proxy_other_boards"]] if x.get("proxy_other_boards") else [])
+if "holders" in picked:
+    st.subheader("Significant holders (5%+)")
+    if p["holders"]:
+        st.dataframe(pd.DataFrame([{"Holder": h["name"], "% of class": h["pct"], "Form": h["form"], "Filed": h["date"]}
+                                   for h in p["holders"]]), hide_index=True, use_container_width=True,
+                     column_config={"% of class": st.column_config.ProgressColumn(
+                         format="%.1f%%", min_value=0, max_value=max(10, max((h["pct"] or 0) for h in p["holders"])))})
+    else:
+        st.caption("No Schedule 13D/13G filings in the last three years.")
+
+if "news" in picked:
+    st.subheader("News and corporate events (last 90 days)")
+    mna = [n for n in p["news"] if n.get("mna")]
+    if mna:
         with st.container(border=True):
-            st.markdown(f"**{x['name']}** · {x['role']}  ·  [SEC filings]({x['edgar_url']}) · [Web profile search]({x['web_url']})")
-            if x["bio"]:
-                st.write(x["bio"])
-            st.caption("Other public company affiliations: " + ("; ".join(others) if others else "none found in SEC filings"))
-else:
-    st.caption(bd.get("note") or "Board information not available.")
+            st.markdown("#### 🔶 M&A and strategic transactions")
+            for n in mna:
+                tag = "🟠 **RUMORED** · " if n.get("rumored") else "🔴 **REPORTED** · "
+                st.markdown(f"{tag}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
+    else:
+        st.caption("No M&A or strategic-transaction news found in the last 90 days.")
+    tab_news, tab_ev = st.tabs([f"All news ({len(p['news'])})", f"Corporate events ({len(p['events'])})"])
+    with tab_news:
+        for n in p["news"]:
+            badge = ("🟠 Rumored M&A · " if n.get("rumored") else "🔴 M&A · ") if n.get("mna") else ""
+            st.markdown(f"{badge}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
+        if not p["news"]:
+            st.caption("No news found in the last 90 days.")
+    with tab_ev:
+        if p["events"]:
+            cats = sorted({x["category"] for x in p["events"]})
+            chosen = st.multiselect("Category", cats, default=cats, key="evcats")
+            st.dataframe(pd.DataFrame([{"Date": x["date"], "Category": x["category"], "Event": x["title"],
+                                        "Status": x["status"], "Source": x["form"], "Link": x["url"]}
+                                       for x in p["events"] if x["category"] in chosen]),
+                         hide_index=True, use_container_width=True,
+                         column_config={"Link": st.column_config.LinkColumn(display_text="open")})
+            st.caption("M&A first. Filed = SEC filing · Reported / Rumored = web news · Estimated = worked out from filing history.")
+        else:
+            st.caption("No events found in the last 90 days.")
+
+if "regm" in picked:
+    st.subheader("Research safe harbor summary")
+    st.info(r["summary"])
+    if r.get("facts"):
+        fc = st.columns(len(r["facts"]))
+        for col, (lab, val) in zip(fc, r["facts"]):
+            col.metric(lab, val)
+    if r.get("harbors"):
+        st.dataframe(pd.DataFrame(r["harbors"], columns=["Safe harbor", "Status", "Basis"]), hide_index=True, use_container_width=True)
+
+if "board" in picked:
+    bd = p["board"]
+    st.subheader(f"Board of directors ({len(bd['directors'])})")
+    if bd["directors"]:
+        st.caption(bd.get("note", "") + (f" Biographies from the {bd['proxy']}." if bd.get("proxy") else ""))
+        for x in bd["directors"]:
+            others = x["other_public_boards"] or ([x["proxy_other_boards"]] if x.get("proxy_other_boards") else [])
+            with st.container(border=True):
+                st.markdown(f"**{x['name']}** · {x['role']}  ·  [SEC filings]({x['edgar_url']}) · [Web profile search]({x['web_url']})")
+                if x["bio"]:
+                    st.write(x["bio"])
+                st.caption("Other public company affiliations: " + ("; ".join(others) if others else "none found in SEC filings"))
+    else:
+        st.caption(bd.get("note") or "Board information not available.")
+
 st.divider()
 st.caption("Sources: " + ", ".join(p["sources"]) + ". Public data only; not investment or legal advice.")

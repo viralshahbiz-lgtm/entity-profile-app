@@ -117,8 +117,9 @@ It refreshes itself every Sunday.
 ### Step 7: Use it
 
 1. Click the search box at the top and **start typing** a company name or ticker. Matches appear as you type. Use the side panel to limit the list by sector or headquarters country.
-2. Pick a company. The profile builds in 20 to 60 seconds the first time and is reused for 6 hours.
-3. Click **Export PDF summary** to download the one- to two-page PDF.
+2. Pick a company. The page opens quickly with just the **company description** and **market data**.
+3. Tick any of the **Add sections** boxes to load more: equity securities and identifiers, fixed income, how it went public, significant holders, news and events, safe harbor summary, board of directors. Each section is fetched only when you tick it, and the results are reused for 6 hours.
+4. For the PDF, click **Prepare full PDF**. It loads every section (about 20 to 60 seconds the first time), then a **Download full PDF** button appears. The PDF always includes every section.
 
 ---
 

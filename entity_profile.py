@@ -1134,16 +1134,33 @@ def _safe(label, fn, default, warnings):
         return default
 
 
-def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None):
+# --------------------------------------------------------------------------
+# Staged loading: a fast base profile, then optional sections on demand
+# --------------------------------------------------------------------------
+SECTIONS = {            # name -> (label, dependencies)
+    "identifiers": ("Equity securities and identifiers", ["holders"]),
+    "debt": ("Fixed income securities", ["identifiers", "annual"]),
+    "listing": ("How and when it went public", []),
+    "holders": ("Significant holders (5%+)", []),
+    "news": ("News and corporate events (last 90 days)", []),
+    "regm": ("Research safe harbor summary", ["annual"]),
+    "board": ("Board of directors", []),
+    "annual": ("Annual report cover", []),          # internal helper section
+}
+USER_SECTIONS = ["identifiers", "debt", "listing", "holders", "news", "regm", "board"]
+SECTION_KEYS = {"identifiers": ["identifiers"], "debt": ["debt"], "listing": ["listing"], "holders": ["holders", "cusips"],
+                "news": ["news", "events"], "regm": ["regm"], "board": ["board"],
+                "annual": ["cover", "annual_raw", "filing_excerpt", "filing_excerpt_source"]}
+
+
+def build_base(cik, settings, sec_tickers, symdir):
+    """Company record, description and market data only: the fast first view."""
+    from concurrent.futures import ThreadPoolExecutor
     cik = str(cik).zfill(10)
     email = settings.get("SEC_CONTACT_EMAIL", "")
-    av_key = settings.get("ALPHAVANTAGE_KEY", "")
-    td_key = settings.get("TWELVEDATA_KEY", "")
-    tav_key = settings.get("TAVILY_KEY", "")
-    figi_key = settings.get("OPENFIGI_KEY", "")
+    av_key, td_key, tav_key = (settings.get(k, "") for k in ("ALPHAVANTAGE_KEY", "TWELVEDATA_KEY", "TAVILY_KEY"))
     warnings, used = [], {"SEC EDGAR"}
 
-    progress("Company record (SEC)")
     sub = src.sec_submissions(cik, email)
     filings = _recent(sub)
     biz = (sub.get("addresses") or {}).get("business") or {}
@@ -1164,7 +1181,6 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         "former_names": [n.get("name") for n in (sub.get("formerNames") or [])][:5],
     }
 
-    progress("Listed securities")
     securities = []
     for t in [x for x in sec_tickers if x["cik"] == cik]:
         dot = t["ticker"].replace("-", ".")
@@ -1172,125 +1188,194 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         name = d.get("name") or company["name"]
         securities.append({"ticker": dot, "exchange": d.get("exchange") or t["exchange"] or "OTC",
                            "country": "US", "name": name, "type": classify(name, d.get("is_etf"), t["exchange"])})
-    if (company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada") and not av_key:
-        warnings.append("TSX listing and TSX prior close need an Alpha Vantage key (ALPHAVANTAGE_KEY); U.S. listing shown only.")
-    elif company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada":
-        try:
-            tsx = src.av_search_tsx(company["name"], av_key)
-            if tsx:
-                securities.append({"ticker": tsx["symbol"].rsplit(".", 1)[0], "av_symbol": tsx["symbol"],
-                                   "exchange": tsx["exchange"], "country": "CA",
-                                   "name": tsx["name"] or company["name"], "type": "Common Stock"})
-        except src.DataError as e:
-            warnings.append(f"TSX listing lookup: {e}")
-    securities.sort(key=lambda s: (s["type"] != "Common Stock", s["country"] != "US", s["ticker"]))
+    canadian = company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada"
 
-    progress("Financial facts (SEC XBRL)")
-    facts = _safe("Financial facts (SEC XBRL)", lambda: src.sec_facts(cik, email), {}, warnings)
-    bs = _safe("Balance sheet figures", lambda: balance_sheet(facts),
-               {"shares_out": None, "public_float": None, "cash": None, "debt": None, "revenue": None}, warnings)
+    def tsx_lookup():
+        if canadian and not av_key:
+            warnings.append("TSX listing and TSX prior close need an Alpha Vantage key (ALPHAVANTAGE_KEY); U.S. listing shown only.")
+        elif canadian:
+            try:
+                tsx = src.av_search_tsx(company["name"], av_key)
+                if tsx:
+                    securities.append({"ticker": tsx["symbol"].rsplit(".", 1)[0], "av_symbol": tsx["symbol"],
+                                       "exchange": tsx["exchange"], "country": "CA",
+                                       "name": tsx["name"] or company["name"], "type": "Common Stock"})
+            except src.DataError as e:
+                warnings.append(f"TSX listing lookup: {e}")
+        securities.sort(key=lambda s: (s["type"] != "Common Stock", s["country"] != "US", s["ticker"]))
 
-    progress("Annual report cover and business text")
-    filing_desc, desc_src, flags, annual_raw = "", "", {}, ""
+    def facts_and_market():
+        tsx_lookup()
+        facts = _safe("Financial facts (SEC XBRL)", lambda: src.sec_facts(cik, email), {}, warnings)
+        bs = _safe("Balance sheet figures", lambda: balance_sheet(facts),
+                   {"shares_out": None, "public_float": None, "cash": None, "debt": None, "revenue": None}, warnings)
+        if av_key or td_key:
+            market = _safe("Market data", lambda: market_data(company, securities, bs, settings, warnings),
+                           {"venues": [], "fx": {"USD": 1.0}}, warnings)
+            used.update(v["provider"] for v in market.get("venues", []))
+        else:
+            market = {"venues": [], "fx": {"USD": 1.0}}
+            warnings.append("Market data is off: add a free Twelve Data key (TWELVEDATA_KEY) and/or Alpha Vantage key "
+                            "(ALPHAVANTAGE_KEY) in the app settings.")
+            if bs.get("public_float"):
+                market["public_float_usd"], market["public_float_date"] = bs["public_float"]["value"], bs["public_float"]["date"]
+            if bs.get("shares_out"):
+                market["shares_out"], market["shares_out_date"] = bs["shares_out"]["value"], bs["shares_out"]["date"]
+        return bs, market
+
+    # Market data and the web description run at the same time
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fm = pool.submit(facts_and_market)
+        wd = pool.submit(lambda: _safe("Web description", lambda: web_description(company, tav_key, warnings, used), None, warnings))
+        bs, market = fm.result()
+        web_desc = wd.result()
+
+    ctx = {"cik": cik, "settings": dict(settings), "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
+           "sub": sub, "filings": filings, "company": company, "securities": securities, "financials": bs,
+           "market": market, "warnings": warnings, "used": used, "loaded": set()}
+    if web_desc:
+        ctx["description"] = {"text": web_desc["text"], "source": web_desc["source"], "links": web_desc["links"]}
+    else:                                   # fall back to the annual report text
+        ensure(ctx, "annual")
+        if ctx.get("filing_excerpt"):
+            ctx["description"] = {"text": concise(ctx["filing_excerpt"]), "source": ctx["filing_excerpt_source"], "links": []}
+        else:
+            ctx["description"] = {"text": "", "source": "", "links": []}
+            warnings.append("No business description found from web search, Wikipedia or the annual report.")
+    if not tav_key:
+        warnings.append("Web search is off: add a free Tavily key (TAVILY_KEY) for the description summary and fuller news.")
+    return ctx
+
+
+def _sec_annual(ctx):
+    cik, email, filings = ctx["cik"], ctx["settings"].get("SEC_CONTACT_EMAIL", ""), ctx["filings"]
+    out = {"cover": {}, "annual_raw": "", "filing_excerpt": "", "filing_excerpt_source": ""}
     annual = next((f for f in filings if f["form"] in ANNUAL), None)
     latest_periodic = next((f for f in filings if f["form"] in PERIODIC), None)
+    if annual:
+        raw, _ = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
+        out["annual_raw"] = raw or ""
+        out["cover"] = cover_flags(raw)
+        desc = extract_description(raw, annual["form"])
+        if not desc and annual["form"] == "40-F":
+            ex = _pick_aif_exhibit(cik, annual, email)
+            if ex:
+                raw2, _ = src.sec_doc(cik, annual["accessionNumber"], ex, email)
+                desc = extract_description(raw2, "40-F")
+        out["filing_excerpt"], out["filing_excerpt_source"] = desc, f"{annual['form']} filed {annual['filingDate']}"
+    elif latest_periodic:
+        raw, _ = src.sec_doc(cik, latest_periodic["accessionNumber"], latest_periodic["primaryDocument"], email)
+        out["cover"] = cover_flags(raw)
+    return out
 
-    def read_annual():
-        nonlocal filing_desc, desc_src, flags, annual_raw
-        if annual:
-            raw, _ = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
-            annual_raw = raw or ""
-            flags = cover_flags(raw)
-            filing_desc = extract_description(raw, annual["form"])
-            if not filing_desc and annual["form"] == "40-F":
-                ex = _pick_aif_exhibit(cik, annual, email)
-                if ex:
-                    raw2, _ = src.sec_doc(cik, annual["accessionNumber"], ex, email)
-                    filing_desc = extract_description(raw2, "40-F")
-            desc_src = f"{annual['form']} filed {annual['filingDate']}"
-        elif latest_periodic:
-            raw, _ = src.sec_doc(cik, latest_periodic["accessionNumber"], latest_periodic["primaryDocument"], email)
-            flags = cover_flags(raw)
-    _safe("Annual report cover and text", read_annual, None, warnings)
 
-    progress("Business description summary (web)")
-    web_desc = _safe("Web description", lambda: web_description(company, tav_key, warnings, used), None, warnings)
-    if web_desc:
-        description = {"text": web_desc["text"], "source": web_desc["source"], "links": web_desc["links"]}
-    elif filing_desc:
-        description = {"text": concise(filing_desc), "source": desc_src, "links": []}
-    else:
-        description = {"text": "", "source": "", "links": []}
-        warnings.append("No business description found from web search, Wikipedia or the annual report.")
-
-    progress("How and when it went public")
-    history = _safe("Older filing history", lambda: full_filing_history(sub, email, warnings), filings, warnings)
-    listing = _safe("Listing history", lambda: listing_history(history, cik, company, sub),
-                    {"kind": "Unknown", "date": None, "summary": "", "link": "", "first_edgar_filing": None}, warnings)
+def _sec_listing(ctx):
+    w, st = ctx["warnings"], ctx["settings"]
+    history = _safe("Older filing history", lambda: full_filing_history(ctx["sub"], st.get("SEC_CONTACT_EMAIL", ""), w),
+                    ctx["filings"], w)
+    listing = listing_history(history, ctx["cik"], ctx["company"], ctx["sub"])
     if listing["kind"] == "Unknown":
-        web = _safe("Web IPO lookup", lambda: web_listing_fallback(company, tav_key, warnings), None, warnings)
+        web = _safe("Web IPO lookup", lambda: web_listing_fallback(ctx["company"], st.get("TAVILY_KEY", ""), w), None, w)
         if web:
             listing.update(web)
         else:
             listing["summary"] = ("Public before electronic SEC filing (EDGAR) began; IPO date not found."
                                   if (listing.get("first_edgar_filing") or "9999") <= "1997-12-31"
                                   else "Route to listing could not be determined from public filings.")
+    return {"listing": listing}
 
-    progress("Significant holders (Schedule 13D/13G)")
-    holders, cusips = _safe("Significant holders", lambda: significant_holders(filings, cik, email), ([], set()), warnings)
 
-    progress("Security identifiers (GLEIF, OpenFIGI)")
-    ids = _safe("Security identifiers", lambda: identifiers(company, securities, cusips, figi_key, warnings, used),
-                {"entity": {"CIK": cik, "LEI": "", "LEI status": "", "EIN": company.get("ein") or ""},
-                 "securities": [], "debt": [], "notes": []}, warnings)
+def _sec_holders(ctx):
+    holders, cusips = significant_holders(ctx["filings"], ctx["cik"], ctx["settings"].get("SEC_CONTACT_EMAIL", ""))
+    return {"holders": holders, "cusips": cusips}
+
+
+def _sec_identifiers(ctx):
+    ids = identifiers(ctx["company"], ctx["securities"], ctx.get("cusips") or set(),
+                      ctx["settings"].get("OPENFIGI_KEY", ""), ctx["warnings"], ctx["used"])
     if ids["entity"].get("LEI"):
-        company["lei"] = ids["entity"]["LEI"]
+        ctx["company"]["lei"] = ids["entity"]["LEI"]
+    return {"identifiers": ids}
 
-    progress("Debt securities")
-    debt = _safe("Debt securities", lambda: debt_securities(filings, cik, email, ids, annual_raw, figi_key, warnings, used),
-                 {"bonds": [], "matured_excluded": 0, "documents_read": 0}, warnings)
-    debt["total_debt"] = bs.get("debt")
 
-    progress("Board of directors")
-    board = _safe("Board of directors", lambda: board_of_directors(filings, cik, email, company["name"], warnings, used),
-                  {"directors": [], "proxy": "", "note": ""}, warnings)
+def _sec_debt(ctx):
+    st = ctx["settings"]
+    debt = debt_securities(ctx["filings"], ctx["cik"], st.get("SEC_CONTACT_EMAIL", ""), ctx["identifiers"],
+                           ctx.get("annual_raw", ""), st.get("OPENFIGI_KEY", ""), ctx["warnings"], ctx["used"])
+    debt["total_debt"] = ctx["financials"].get("debt")
+    return {"debt": debt}
 
-    progress("Market data")
-    if av_key or td_key:
-        market = _safe("Market data", lambda: market_data(company, securities, bs, settings, warnings),
-                       {"venues": [], "fx": {"USD": 1.0}}, warnings)
-        used.update(v["provider"] for v in market.get("venues", []))
-    else:
-        market = {"venues": [], "fx": {"USD": 1.0}}
-        warnings.append("Market data is off: add a free Twelve Data key (TWELVEDATA_KEY) and/or Alpha Vantage key "
-                        "(ALPHAVANTAGE_KEY) in the app settings.")
-        if bs.get("public_float"):
-            market["public_float_usd"], market["public_float_date"] = bs["public_float"]["value"], bs["public_float"]["date"]
-        if bs.get("shares_out"):
-            market["shares_out"], market["shares_out_date"] = bs["shares_out"]["value"], bs["shares_out"]["date"]
 
-    progress("News and corporate events (last 90 days)")
-    us_common = next((s for s in securities if s["country"] == "US" and s["type"] == "Common Stock"), None)
-    news = _safe("News", lambda: web_news(company, us_common["ticker"] if us_common else "", tav_key, warnings, used), [], warnings)
-    if not tav_key:
-        warnings.append("Web search is off: add a free Tavily key (TAVILY_KEY) for the description summary, IPO summary "
-                        "and fuller news. News falls back to GDELT.")
-    events = sorted(_safe("Corporate events", lambda: corporate_events(filings, cik), [], warnings) +
-                    _safe("Web events", lambda: web_events(news), [], warnings), key=lambda e: e["date"], reverse=True)
+def _sec_board(ctx):
+    return {"board": board_of_directors(ctx["filings"], ctx["cik"], ctx["settings"].get("SEC_CONTACT_EMAIL", ""),
+                                        ctx["company"]["name"], ctx["warnings"], ctx["used"])}
+
+
+def _sec_news(ctx):
+    w, st = ctx["warnings"], ctx["settings"]
+    us_common = next((s for s in ctx["securities"] if s["country"] == "US" and s["type"] == "Common Stock"), None)
+    news = _safe("News", lambda: web_news(ctx["company"], us_common["ticker"] if us_common else "", st.get("TAVILY_KEY", ""),
+                                          w, ctx["used"]), [], w)
+    events = sorted(_safe("Corporate events", lambda: corporate_events(ctx["filings"], ctx["cik"]), [], w) +
+                    _safe("Web events", lambda: web_events(news), [], w), key=lambda e: e["date"], reverse=True)
     events.sort(key=lambda e: e["category"] != "M&A")      # M&A and strategic transactions first
+    return {"news": news[:25], "events": events}
 
-    profile = {
-        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "company": company, "cover": flags, "financials": bs, "market": market,
-        "description": description, "filing_excerpt": filing_desc, "filing_excerpt_source": desc_src,
-        "listing": listing, "identifiers": ids, "debt": debt, "board": board,
-        "securities": securities, "holders": holders, "events": events, "news": news[:25],
-        "filings": filings, "warnings": warnings, "sources": sorted(used),
-    }
-    profile["regm"] = _safe("Safe harbor summary", lambda: regm.analyse(profile),
-                            {"summary": "Safe harbor summary unavailable.", "harbors": [], "facts": [], "actively_traded": None},
-                            warnings)
-    return profile
+
+def _sec_regm(ctx):
+    return {"regm": regm.analyse(to_profile(ctx))}
+
+
+SECTION_FUNCS = {"annual": _sec_annual, "listing": _sec_listing, "holders": _sec_holders, "identifiers": _sec_identifiers,
+                 "debt": _sec_debt, "board": _sec_board, "news": _sec_news, "regm": _sec_regm}
+SECTION_DEFAULTS = {
+    "annual": {"cover": {}, "annual_raw": "", "filing_excerpt": "", "filing_excerpt_source": ""},
+    "listing": {"listing": {"kind": "Unknown", "date": None, "summary": "", "link": "", "first_edgar_filing": None}},
+    "holders": {"holders": [], "cusips": set()},
+    "identifiers": {"identifiers": {"entity": {"CIK": "", "LEI": "", "LEI status": "", "EIN": ""}, "securities": [], "debt": [], "notes": []}},
+    "debt": {"debt": {"bonds": [], "matured_excluded": 0, "documents_read": 0, "total_debt": None}},
+    "board": {"board": {"directors": [], "proxy": "", "note": ""}},
+    "news": {"news": [], "events": []},
+    "regm": {"regm": {"summary": "Safe harbor summary unavailable.", "harbors": [], "facts": [], "actively_traded": None}},
+}
+
+
+def ensure(ctx, name):
+    """Load one section (and anything it depends on) into ctx, once."""
+    if name in ctx["loaded"]:
+        return ctx
+    for dep in SECTIONS[name][1]:
+        ensure(ctx, dep)
+    label = SECTIONS[name][0]
+    import copy
+    ctx.update(_safe(label, lambda: SECTION_FUNCS[name](ctx), copy.deepcopy(SECTION_DEFAULTS[name]), ctx["warnings"]))
+    ctx["loaded"].add(name)
+    return ctx
+
+
+def section_data(ctx, name):
+    return {k: ctx[k] for k in SECTION_KEYS[name] if k in ctx}
+
+
+def to_profile(ctx):
+    """The profile dict the page and PDF read; sections not loaded yet are empty."""
+    p = {"as_of": ctx["as_of"], "company": ctx["company"], "financials": ctx["financials"], "market": ctx["market"],
+         "description": ctx["description"] if "description" in ctx else {"text": "", "source": "", "links": []},
+         "securities": ctx["securities"], "filings": ctx["filings"], "warnings": ctx["warnings"],
+         "sources": sorted(ctx["used"]), "loaded": sorted(ctx["loaded"])}
+    for name, defaults in SECTION_DEFAULTS.items():
+        for k, v in defaults.items():
+            p[k] = ctx.get(k, v)
+    return p
+
+
+def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None):
+    """Everything at once (used for the full PDF and for testing)."""
+    ctx = build_base(cik, settings, sec_tickers, symdir)
+    for name in USER_SECTIONS:
+        progress(SECTIONS[name][0])
+        ensure(ctx, name)
+    return to_profile(ctx)
 
 
 def classify(name, is_etf, sec_exchange):
