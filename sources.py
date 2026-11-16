@@ -5,7 +5,8 @@ Data sources for the entity profile page. Public data only.
     company tickers, submissions (filing history), company facts (XBRL),
     filing documents (annual report text, cover-page flags, Schedule 13D/13G)
 - Nasdaq Trader symbol directory (free) for security names on U.S. exchanges
-- Alpha Vantage (free key) for prices and volumes, U.S. and TSX
+- Twelve Data (free key) for prior-close prices and volumes on U.S. listings
+- Alpha Vantage (free key) for TSX prices and as a backup for U.S. prices
 - Tavily web search (free key) for news, events, description and IPO summaries
 - GDELT news search (free, no key) as a news fallback
 - Wikipedia (free, no key) as a description fallback
@@ -30,6 +31,7 @@ SEC_ARCHIVE = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{doc}"
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 AV_URL = "https://www.alphavantage.co/query"
+TD_URL = "https://api.twelvedata.com"
 TAVILY_URL = "https://api.tavily.com/search"
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
@@ -218,6 +220,44 @@ def av_search_tsx(company_name, key):
             return {"symbol": sym, "name": m.get("2. name", ""), "currency": m.get("8. currency", "CAD"),
                     "exchange": "TSXV" if sym.endswith(".TRV") else "TSX"}
     return None
+
+
+# --------------------------------------------------------------------------
+# Twelve Data (free Basic plan: U.S. equities, forex; 8 calls a minute, 800 a day)
+# --------------------------------------------------------------------------
+def _td(path, params, key):
+    if not key:
+        raise DataError("No Twelve Data key set.")
+    txt = http_get(f"{TD_URL}/{path}", params=dict(params, apikey=key))
+    data = json.loads(txt or "{}")
+    if isinstance(data, dict) and data.get("status") == "error":
+        code = data.get("code")
+        if code == 429:
+            raise QuotaError("Twelve Data free limit reached (8 calls a minute, 800 a day).")
+        if code in (401, 403):
+            raise DataError(f"Twelve Data: {data.get('message', 'key not accepted or symbol not on the free plan')}")
+        raise DataError(f"Twelve Data has no data for {params.get('symbol')}: {data.get('message', '')[:120]}")
+    return data
+
+
+def td_daily(symbol, key, bars=300):
+    """Daily bars, oldest first: list of (date, high, low, close, volume). One API credit."""
+    d = _td("time_series", {"symbol": symbol, "interval": "1day", "outputsize": bars}, key)
+    rows = []
+    for v in d.get("values") or []:
+        try:
+            rows.append((v["datetime"][:10], float(v["high"]), float(v["low"]), float(v["close"]),
+                         float(v.get("volume") or 0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(rows)
+
+
+def td_fx(from_ccy, to_ccy, key):
+    d = _td("exchange_rate", {"symbol": f"{from_ccy}/{to_ccy}"}, key)
+    if not d.get("rate"):
+        raise DataError("No exchange rate returned.")
+    return float(d["rate"])
 
 
 def av_fx(from_ccy, to_ccy, key):

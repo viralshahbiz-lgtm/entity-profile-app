@@ -377,22 +377,36 @@ def significant_holders(filings, cik, email, years=HOLDER_YEARS, max_filings=25)
 # --------------------------------------------------------------------------
 # Market data
 # --------------------------------------------------------------------------
-def venue_stats(symbol, exchange, currency, key):
-    daily = src.av_daily(symbol, key)
-    if not daily:
+def _drop_live_bar(bars):
+    """Keep only completed sessions so the price is the prior close, not an intraday print."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:                      # tzdata missing: assume UTC-5
+        now = datetime.utcnow() - timedelta(hours=5)
+    today = now.date().isoformat()
+    if bars and bars[-1][0] == today and (now.hour, now.minute) < (16, 30):
+        return bars[:-1]
+    return bars
+
+
+def _stats_from_daily(bars, symbol, exchange, currency, provider):
+    """bars: (date, high, low, close, volume), oldest first, completed sessions only."""
+    if not bars:
         raise src.DataError(f"No price history for {symbol}.")
-    weekly = src.av_weekly(symbol, key)
-    last_d, last_px, _ = daily[-1]
+    last_d, _, _, last_px, _ = bars[-1]
     cut60 = (date.fromisoformat(last_d) - timedelta(days=60)).isoformat()
-    win = [(c, v) for d, c, v in daily if d > cut60]
-    m1 = daily[-22][1] if len(daily) >= 22 else None
+    win = [(c, v) for d, h, l, c, v in bars if d > cut60]
+    m1 = bars[-22][3] if len(bars) >= 22 else None
     cut52 = (date.fromisoformat(last_d) - timedelta(days=364)).isoformat()
-    wk = [w for w in weekly if w[0] > cut52] or weekly[-52:]
-    hi = max(wk, key=lambda w: w[1]) if wk else None
-    lo = min(wk, key=lambda w: w[2]) if wk else None
+    yr = [b for b in bars if b[0] > cut52]
+    hi = max(yr, key=lambda b: b[1]) if yr else None
+    lo = min(yr, key=lambda b: b[2]) if yr else None
+    prev = bars[-2][3] if len(bars) >= 2 else None
     return {
-        "symbol": symbol, "exchange": exchange, "currency": currency,
+        "symbol": symbol, "exchange": exchange, "currency": currency, "provider": provider,
         "price": last_px, "price_date": last_d,
+        "change_1d_pct": (last_px / prev - 1) * 100 if prev else None,
         "change_1m_pct": (last_px / m1 - 1) * 100 if m1 else None,
         "high_52w": hi[1] if hi else None, "high_52w_week": hi[0] if hi else None,
         "low_52w": lo[2] if lo else None, "low_52w_week": lo[0] if lo else None,
@@ -400,10 +414,37 @@ def venue_stats(symbol, exchange, currency, key):
         "adtv_value": statistics.mean(c * v for c, v in win) if win else None,
         "adtv_days": len(win),
         "adtv_window": f"{cut60} to {last_d}",
+        "full_year": bool(yr) and yr[0][0] <= (date.fromisoformat(last_d) - timedelta(days=350)).isoformat(),
     }
 
 
-def market_data(company, securities, facts_bs, key, warnings):
+def venue_stats(sec, currency, keys, warnings):
+    """Prior-close statistics for one listing. U.S.: Twelve Data first, Alpha Vantage as backup. TSX: Alpha Vantage."""
+    td_key, av_key = keys.get("TWELVEDATA_KEY", ""), keys.get("ALPHAVANTAGE_KEY", "")
+    if currency == "USD" and td_key:
+        try:
+            bars = _drop_live_bar(src.td_daily(sec["ticker"], td_key))
+            return _stats_from_daily(bars, sec["ticker"], sec["exchange"], currency, "Twelve Data")
+        except src.DataError as e:
+            if not av_key:
+                raise
+            warnings.append(f"Twelve Data for {sec['ticker']}: {e} Trying Alpha Vantage.")
+    if not av_key:
+        raise src.DataError("needs an Alpha Vantage key" if currency == "CAD" else "no price provider key set")
+    sym = sec.get("av_symbol") or sec["ticker"].replace(".", "-")
+    daily = _drop_live_bar([(d, c, c, c, v) for d, c, v in src.av_daily(sym, av_key)])
+    weekly = src.av_weekly(sym, av_key)
+    st = _stats_from_daily(daily, sym, sec["exchange"], currency, "Alpha Vantage")
+    last_d = st["price_date"]
+    cut52 = (date.fromisoformat(last_d) - timedelta(days=364)).isoformat()
+    wk = [w for w in weekly if w[0] > cut52] or weekly[-52:]
+    if wk:                                        # compact daily has ~100 bars; use weekly for the 52-week range
+        hi, lo = max(wk, key=lambda w: w[1]), min(wk, key=lambda w: w[2])
+        st.update(high_52w=hi[1], high_52w_week=hi[0], low_52w=lo[2], low_52w_week=lo[0], full_year=True)
+    return st
+
+
+def market_data(company, securities, facts_bs, keys, warnings):
     out = {"venues": [], "fx": {"USD": 1.0}, "notes": []}
     common = [s for s in securities if s["type"] == "Common Stock" or s["type"] == "ADR/ADS"]
     us = next((s for s in common if s["country"] == "US" and s["exchange"] != "OTC"), None) or \
@@ -413,19 +454,21 @@ def market_data(company, securities, facts_bs, key, warnings):
         if not s:
             continue
         try:
-            sym = s.get("av_symbol") or s["ticker"].replace(".", "-")
-            out["venues"].append(venue_stats(sym, s["exchange"], ccy, key))
+            out["venues"].append(venue_stats(s, ccy, keys, warnings))
         except src.QuotaError as e:
             warnings.append(str(e))
-            break
         except src.DataError as e:
             warnings.append(f"Market data for {s['ticker']}: {e}")
     if any(v["currency"] == "CAD" for v in out["venues"]):
-        try:
-            out["fx"]["CAD"] = src.av_fx("CAD", "USD", key)
-        except src.DataError as e:
-            out["fx"]["CAD"] = None
-            warnings.append(f"CAD/USD rate unavailable ({e}); worldwide ADTV shows U.S. trading only.")
+        out["fx"]["CAD"] = None
+        for fn, k in ((src.td_fx, keys.get("TWELVEDATA_KEY")), (src.av_fx, keys.get("ALPHAVANTAGE_KEY"))):
+            if k and out["fx"]["CAD"] is None:
+                try:
+                    out["fx"]["CAD"] = fn("CAD", "USD", k)
+                except src.DataError:
+                    pass
+        if out["fx"]["CAD"] is None:
+            warnings.append("CAD/USD rate unavailable; worldwide ADTV shows U.S. trading only.")
     if not out["venues"]:
         return out
     p = out["venues"][0]
@@ -463,6 +506,172 @@ def market_data(company, securities, facts_bs, key, warnings):
 
 
 # --------------------------------------------------------------------------
+# Fixed income: publicly issued debt securities
+# --------------------------------------------------------------------------
+DEBT_DESC = re.compile(r"(\d{1,2}(?:\.\d{1,4})?)\s?%\s+((?:(?:Senior|Subordinated|Junior|Secured|Unsecured|Convertible|"
+                       r"Exchangeable|Fixed[- ]Rate|Floating[- ]Rate|Green|Sustainability(?:-Linked)?)\s+)*)"
+                       r"(Notes|Debentures|Bonds)\s+due\s+((?:[A-Z][a-z]+\s+\d{1,2},\s+)?(?:19|20)\d{2})", re.I)
+FLOAT_DESC = re.compile(r"(Floating[- ]Rate\s+(?:Senior\s+)?Notes)\s+due\s+((?:[A-Z][a-z]+\s+\d{1,2},\s+)?(?:19|20)\d{2})", re.I)
+CUSIP_RE = re.compile(r"CUSIP(?:\s*(?:No\.?|Number|Numbers))?\s*(?:/\s*ISIN)?\s*[:#]?\s*([0-9]{3}[0-9A-Z]{5}[0-9])\b", re.I)
+ISIN_RE = re.compile(r"\b((?:US|CA)[0-9A-Z]{9}[0-9])\b")
+PRINC_RE = re.compile(r"(?:U\.?S\.?)?\$\s?([\d,]+(?:\.\d+)?)\s*(million|billion)?\s+(?:in\s+)?aggregate\s+principal\s+amount", re.I)
+MAT_RE = re.compile(r"Maturity(?:\s+Date)?\s*[:\-]?\s*([A-Z][a-z]+\s+\d{1,2},\s+\d{4})")
+OFFER_FORMS = ("424B2", "424B5", "424B3", "FWP", "424B4", "424B7")
+
+
+def cover_12b(raw):
+    """Classes registered on an exchange, from the Inline XBRL cover of the annual report."""
+    rows = {}
+    for m in re.finditer(r'<ix:nonNumeric\b([^>]*)>(.*?)</ix:nonNumeric>', raw or "", re.S | re.I):
+        nm = re.search(r'name="dei:(Security12bTitle|TradingSymbol|SecurityExchangeName|NoTradingSymbolFlag)"', m.group(1))
+        ctx = re.search(r'contextRef="([^"]+)"', m.group(1))
+        if nm and ctx:
+            val = html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+            rows.setdefault(ctx.group(1), {})[nm.group(1)] = val
+    out = []
+    for r in rows.values():
+        if r.get("Security12bTitle"):
+            out.append({"title": r["Security12bTitle"], "symbol": r.get("TradingSymbol", ""),
+                        "exchange": r.get("SecurityExchangeName", "")})
+    return out
+
+
+def _amount(num, unit):
+    try:
+        v = float(num.replace(",", ""))
+    except ValueError:
+        return None
+    return v * (1e9 if (unit or "").lower() == "billion" else 1e6 if (unit or "").lower() == "million" else 1)
+
+
+def _maturity_year(text):
+    m = re.search(r"(19|20)\d{2}", text or "")
+    return m.group(0) if m else ""
+
+
+def parse_debt_terms(text):
+    """Split an offering document into tranches and pull coupon, maturity, CUSIP/ISIN and size for each."""
+    hits = [(m.start(), m) for m in DEBT_DESC.finditer(text)] + [(m.start(), m) for m in FLOAT_DESC.finditer(text)]
+    hits.sort(key=lambda h: h[0])
+    out, seen = [], set()
+    for k, (pos, m) in enumerate(hits):
+        window = text[pos: hits[k + 1][0] if k + 1 < len(hits) else pos + 2500][:2500]
+        if m.re is DEBT_DESC:
+            coupon, kind, due = m.group(1), " ".join((m.group(2) + m.group(3)).split()), m.group(4)
+            desc = f"{coupon}% {kind} due {due}"
+        else:
+            coupon, due = "Floating", m.group(2)
+            desc = f"{' '.join(m.group(1).split())} due {due}"
+        c = CUSIP_RE.search(window)
+        i = ISIN_RE.search(window)
+        prev_end = hits[k - 1][0] + 80 if k else max(0, pos - 400)
+        p = PRINC_RE.search(window) or PRINC_RE.search(text[max(prev_end, pos - 400): pos])
+        mat = MAT_RE.search(window)
+        cusip = c.group(1) if c else (src.cusip_from_isin(i.group(1)) if i else "")
+        key = cusip or desc.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"description": desc, "coupon": coupon, "maturity": mat.group(1) if mat else due,
+                    "cusip": cusip, "isin": i.group(1) if i else (src.isin_from_cusip(cusip, "US") if cusip else ""),
+                    "principal": _amount(*p.groups()) if p else None})
+    return out
+
+
+def _parse_figi_bond(row):
+    """OpenFIGI bond tickers look like 'AAPL 4.65 02/23/46' or 'XYZ F 12/15/27'."""
+    t = row.get("ticker") or row.get("securityDescription") or ""
+    m = re.search(r"\s(\d+(?:\.\d+)?|F|V|0)\s+(\d{2}/\d{2}/\d{2,4})", t)
+    if not m:
+        return None, None
+    cpn = "Floating" if m.group(1) in ("F", "V") else m.group(1)
+    mm, dd, yy = m.group(2).split("/")
+    yy = ("20" + yy) if len(yy) == 2 and int(yy) < 70 else ("19" + yy if len(yy) == 2 else yy)
+    return cpn, f"{yy}-{mm}-{dd}"
+
+
+def debt_securities(filings, cik, email, ids, annual_raw, figi_key, warnings, used, years=3, max_docs=8):
+    today = date.today().isoformat()
+    bonds = {}
+
+    def merge(rec, source, link=""):
+        key = rec.get("cusip") or rec.get("isin") or rec["description"].lower()
+        cur = bonds.setdefault(key, {"description": "", "coupon": "", "maturity": "", "isin": "", "cusip": "",
+                                     "figi": "", "principal": None, "listed": "", "sources": [], "link": ""})
+        for k in ("description", "coupon", "maturity", "isin", "cusip", "figi", "principal", "listed"):
+            if rec.get(k) and not cur[k]:
+                cur[k] = rec[k]
+        if source not in cur["sources"]:
+            cur["sources"].append(source)
+        cur["link"] = cur["link"] or link
+
+    # 1. Recent offering documents (pricing term sheets and prospectus supplements)
+    cutoff = (date.today() - timedelta(days=365 * years)).isoformat()
+    docs = [f for f in filings if f["form"] in OFFER_FORMS and f["filingDate"] >= cutoff][:max_docs]
+    for f in docs:
+        try:
+            raw, url = src.sec_doc(cik, f["accessionNumber"], f["primaryDocument"], email)
+        except src.DataError:
+            continue
+        for t in parse_debt_terms(html_to_text(raw)[:400_000]):
+            merge(t, f"{f['form']} {f['filingDate']}", url)
+
+    # 2. ISINs mapped to the issuer's LEI (GLEIF) that look like debt, described through OpenFIGI
+    isins = [d["isin"] for d in ids.get("debt", [])][:40]
+    if isins:
+        try:
+            res = src.openfigi_map([{"idType": "ID_ISIN", "idValue": i} for i in isins], figi_key)
+            for isin, data in zip(isins, res):
+                row = next((d for d in data if d.get("marketSector") in ("Corp", "Pfd", None)), data[0] if data else {})
+                cpn, mat = _parse_figi_bond(row) if row else (None, None)
+                desc = (row.get("securityDescription") or row.get("ticker") or "") if row else ""
+                merge({"description": desc or "Debt security (GLEIF mapping)", "coupon": cpn or "", "maturity": mat or "",
+                       "isin": isin, "cusip": src.cusip_from_isin(isin), "figi": row.get("figi", "") if row else ""},
+                      "GLEIF/OpenFIGI")
+        except src.DataError as e:
+            warnings.append(f"OpenFIGI (debt): {e}")
+            for isin in isins:
+                merge({"description": "Debt security (GLEIF mapping)", "isin": isin, "cusip": src.cusip_from_isin(isin)},
+                      "GLEIF")
+
+    # 3. Debt listed on an exchange (Section 12(b) classes on the annual report cover)
+    for r in cover_12b(annual_raw):
+        if re.search(r"\b(notes?|debentures?|bonds?)\b", r["title"], re.I):
+            listed = f"{r['exchange']} {r['symbol']}".strip()
+            yr, cpn = _maturity_year(r["title"]), re.search(r"(\d{1,2}(?:\.\d+)?)\s?%", r["title"])
+            match = next((b for b in bonds.values() if yr and yr in (b["maturity"] + b["description"])
+                          and cpn and cpn.group(1).rstrip("0").rstrip(".") in b["coupon"] + b["description"]), None)
+            if match:
+                match["listed"] = match["listed"] or listed
+                match["sources"].append("10-K cover")
+            else:
+                merge({"description": r["title"], "coupon": cpn.group(1) if cpn else "", "maturity": yr, "listed": listed},
+                      "10-K cover")
+
+    def norm_mat(m):
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", m or ""):
+            return m
+        try:
+            return datetime.strptime(m, "%B %d, %Y").date().isoformat()
+        except (TypeError, ValueError):
+            y = _maturity_year(m)
+            return f"{y}-12-31" if y else ""
+
+    rows, matured = [], 0
+    for b in bonds.values():
+        nm = norm_mat(b["maturity"])
+        if nm and nm < today:
+            matured += 1
+            continue
+        b["maturity_sort"] = nm or "9999"
+        rows.append(b)
+    rows.sort(key=lambda b: b["maturity_sort"])
+    if rows:
+        used.add("SEC EDGAR offering documents")
+    return {"bonds": rows, "matured_excluded": matured, "documents_read": len(docs)}
+
+
+# --------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
@@ -483,51 +692,49 @@ def full_filing_history(sub, email, warnings):
     return sorted(rows, key=lambda f: f["filingDate"], reverse=True)
 
 
-def listing_history(history, cik, company):
-    """Infer how and when the company went public from its EDGAR filing history."""
+SPAC_NAME = re.compile(r"\b(acquisition|blank check|spac|merger)\s+(corp|corporation|company|co|inc|ltd|limited|holdings)\b|"
+                       r"\bacquisition\s+corp", re.I)
+
+
+def listing_history(history, cik, company, sub=None):
+    """One-line answer: IPO date, or SPAC / blank-check merger (with date), or another route."""
     oldest_first = list(reversed(history))
     first = oldest_first[0]["filingDate"] if oldest_first else None
+
     def find(pred):
         return next((f for f in oldest_first if pred(f)), None)
     link = lambda f: src.filing_url(cik, f["accessionNumber"], f["primaryDocument"]) if f else ""
     reg = find(lambda f: f["form"] in ("S-1", "F-1", "S-1/A", "F-1/A", "DRS"))
     priced = find(lambda f: f["form"] == "424B4" and (reg is None or f["filingDate"] >= reg["filingDate"]))
     shell_exit = find(lambda f: f["form"].startswith("8-K") and "5.06" in (f.get("items") or ""))
+    merger_reg = find(lambda f: f["form"] in ("S-4", "F-4", "S-4/A", "F-4/A", "DEFM14A"))
+    former = [n for n in ((sub or {}).get("formerNames") or []) if SPAC_NAME.search(n.get("name") or "")]
+    spac_name = former[-1]["name"].title() if former else ""
     form10 = find(lambda f: f["form"] in ("10-12B", "10-12B/A"))
     mjds = find(lambda f: f["form"] in ("40FR12B", "40-F"))
-    fpi_reg = find(lambda f: f["form"] in ("20FR12B",))
-    succ = find(lambda f: f["form"] == "8-K12B")
     exch = find(lambda f: f["form"] in ("8-A12B", "8-A12B/A"))
-    spac_name = any(re.search(r"acquisition corp|capital corp|spac", n or "", re.I) for n in company.get("former_names") or [])
 
-    evidence = [(f["form"], f["filingDate"], link(f)) for f in (reg, priced, shell_exit, form10, mjds, fpi_reg, succ, exch) if f]
-    if shell_exit and (spac_name or find(lambda f: f["form"] in ("S-4", "F-4") and f["filingDate"] <= shell_exit["filingDate"])):
-        method, when = "Merger with a SPAC (de-SPAC); exited shell status", shell_exit["filingDate"]
-    elif priced and reg:
-        method, when = "Underwritten initial public offering (IPO)", priced["filingDate"]
-    elif form10:
-        method, when = "Spin-off from a parent company (Form 10 registration)", form10["filingDate"]
-    elif mjds and (not exch or mjds["filingDate"] <= exch["filingDate"]):
-        method, when = "Canadian company listed in the U.S. under the MJDS (Form 40-F registration)", mjds["filingDate"]
-    elif fpi_reg:
-        method, when = "Foreign company registered a class of securities for U.S. listing (Form 20-F)", fpi_reg["filingDate"]
-    elif succ:
-        method, when = "Successor issuer after a reorganization or redomicile (8-K12B)", succ["filingDate"]
-    elif reg and exch and not priced:
-        method, when = "Possible direct listing (registration statement and exchange listing without a priced IPO prospectus)", exch["filingDate"]
-    elif first and first <= "1997-12-31":
-        method, when = "Public before EDGAR electronic filing began (mid-1990s); see web summary", None
-    else:
-        method, when = "Not determinable from EDGAR filings; see web summary", None
-    return {"method": method, "date": when, "first_edgar_filing": first,
-            "exchange_registration": exch["filingDate"] if exch else None, "evidence": evidence}
+    def out(kind, when, text, f):
+        return {"kind": kind, "date": when, "summary": text, "link": link(f), "first_edgar_filing": first}
+
+    if shell_exit and (former or merger_reg) or (former and shell_exit is None and merger_reg):
+        f = shell_exit or merger_reg
+        when = (shell_exit or merger_reg)["filingDate"]
+        who = f" ({spac_name})" if spac_name else ""
+        return out("SPAC", when, f"Went public by merging with a SPAC / blank-check company{who}; completed {when}.", f)
+    if priced and reg and not former:
+        return out("IPO", priced["filingDate"], f"IPO on {priced['filingDate']}.", priced)
+    if form10:
+        return out("Spin-off", form10["filingDate"], f"Spin-off; registered {form10['filingDate']}.", form10)
+    if mjds and (not exch or mjds["filingDate"] <= exch["filingDate"]):
+        return out("Cross-listing", mjds["filingDate"],
+                   f"Canadian company cross-listed in the U.S. (MJDS) on {mjds['filingDate']}.", mjds)
+    if reg and exch and not priced:
+        return out("Direct listing", exch["filingDate"], f"Direct listing (no IPO prospectus) on {exch['filingDate']}.", exch)
+    return out("Unknown", None, "", None)
 
 
-# --------------------------------------------------------------------------
-# Web search: description summary, IPO summary, news and web-detected events
-# --------------------------------------------------------------------------
 def web_description(company, tav_key, warnings, used):
-    name = src.clean_name(company["name"])
     if tav_key:
         try:
             r = src.tavily(f"What does {company['name']} ({company['industry']}) do? Business overview, main products, "
@@ -548,16 +755,52 @@ def web_description(company, tav_key, warnings, used):
     return None
 
 
-def web_ipo_summary(company, tav_key, warnings):
+def web_listing_fallback(company, tav_key, warnings):
+    """Only used when EDGAR can't tell (e.g. listed before electronic filing): ask web search for the IPO date."""
     if not tav_key:
         return None
     try:
-        r = src.tavily(f"When and how did {company['name']} go public? IPO date, exchange, offering price, "
-                       f"or SPAC merger / direct listing / spin-off", tav_key, max_results=5)
-        return {"text": r["answer"], "links": [(x["title"], x["url"]) for x in r["results"][:3]]} if r["answer"] else None
+        r = src.tavily(f"{company['name']} IPO date: when did it go public, and was it through a SPAC merger?",
+                       tav_key, max_results=5)
     except src.DataError as e:
-        warnings.append(f"Web IPO summary: {e}")
+        warnings.append(f"Web IPO lookup: {e}")
         return None
+    ans = r.get("answer") or ""
+    if not ans:
+        return None
+    m = re.search(r"((?:January|February|March|April|May|June|July|August|September|October|November|December)"
+                  r"\s+(?:\d{1,2},\s+)?\d{4})|\b((?:19|20)\d{2})\b", ans)
+    when = (m.group(1) or m.group(2)) if m else None
+    spac = re.search(r"\b(SPAC|special purpose acquisition|blank[- ]check)\b", ans, re.I)
+    if not when:
+        return None
+    link = r["results"][0]["url"] if r.get("results") else ""
+    text = (f"Went public by merging with a SPAC / blank-check company in {when} (web search)." if spac
+            else f"IPO in {when} (web search).")
+    return {"kind": "SPAC" if spac else "IPO", "date": when, "summary": text, "link": link}
+
+
+NOT_ARTICLE_URL = re.compile(
+    r"/(quote|quotes|symbol|stock-price|stocks?/[a-z.\-]+/?$|markets/stocks|company-profile|profile|chart|options|"
+    r"financials|historical|key-statistics|holders|analysis|earnings-calendar|investor-relations|investors/?$|"
+    r"market-activity|news-headlines|press-release-list|"
+    r"press-releases/?$|news/?$|tag/|topic/|search)", re.I)
+NOT_ARTICLE_HOST = re.compile(r"(wikipedia\.org|sec\.gov|youtube\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|"
+                              r"stocktwits\.com|google\.com)$", re.I)
+NOT_ARTICLE_TITLE = re.compile(r"(stock price|stock quote|share price|\bquote\b|price & news|price and news|"
+                               r"stock forecast|price target|chart|historical data|company profile)", re.I)
+
+
+def is_article(url, title):
+    """Keep links to individual news stories; drop quote pages, profiles, section fronts and home pages."""
+    m = re.match(r"https?://([^/]+)(/.*)?$", url or "")
+    if not m:
+        return False
+    host, path = m.group(1).lower().removeprefix("www."), (m.group(2) or "/").split("?")[0]
+    if NOT_ARTICLE_HOST.search(host) or NOT_ARTICLE_URL.search(path) or NOT_ARTICLE_TITLE.search(title or ""):
+        return False
+    segs = [x for x in path.split("/") if x]
+    return bool(segs) and (len(segs) >= 2 or len(segs[-1]) >= 20 or "-" in segs[-1])
 
 
 def web_news(company, ticker, tav_key, warnings, used, days=EVENT_DAYS):
@@ -583,7 +826,7 @@ def web_news(company, ticker, tav_key, warnings, used, days=EVENT_DAYS):
         if d and d < cutoff:
             continue
         key = re.sub(r"\W+", " ", it["title"].lower())[:80]
-        if not it["title"] or key in seen:
+        if not it["title"] or key in seen or not is_article(it["url"], it["title"]):
             continue
         seen.add(key)
         out.append(dict(it, date=d or ""))
@@ -704,6 +947,7 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
     cik = str(cik).zfill(10)
     email = settings.get("SEC_CONTACT_EMAIL", "")
     av_key = settings.get("ALPHAVANTAGE_KEY", "")
+    td_key = settings.get("TWELVEDATA_KEY", "")
     tav_key = settings.get("TAVILY_KEY", "")
     figi_key = settings.get("OPENFIGI_KEY", "")
     warnings, used = [], {"SEC EDGAR"}
@@ -737,7 +981,9 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         name = d.get("name") or company["name"]
         securities.append({"ticker": dot, "exchange": d.get("exchange") or t["exchange"] or "OTC",
                            "country": "US", "name": name, "type": classify(name, d.get("is_etf"), t["exchange"])})
-    if company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada":
+    if (company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada") and not av_key:
+        warnings.append("TSX listing and TSX prior close need an Alpha Vantage key (ALPHAVANTAGE_KEY); U.S. listing shown only.")
+    elif company["hq_country"] == "Canada" or company["incorporation_country"] == "Canada":
         try:
             tsx = src.av_search_tsx(company["name"], av_key)
             if tsx:
@@ -754,14 +1000,15 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
                {"shares_out": None, "public_float": None, "cash": None, "debt": None, "revenue": None}, warnings)
 
     progress("Annual report cover and business text")
-    filing_desc, desc_src, flags = "", "", {}
+    filing_desc, desc_src, flags, annual_raw = "", "", {}, ""
     annual = next((f for f in filings if f["form"] in ANNUAL), None)
     latest_periodic = next((f for f in filings if f["form"] in PERIODIC), None)
 
     def read_annual():
-        nonlocal filing_desc, desc_src, flags
+        nonlocal filing_desc, desc_src, flags, annual_raw
         if annual:
             raw, _ = src.sec_doc(cik, annual["accessionNumber"], annual["primaryDocument"], email)
+            annual_raw = raw or ""
             flags = cover_flags(raw)
             filing_desc = extract_description(raw, annual["form"])
             if not filing_desc and annual["form"] == "40-F":
@@ -787,10 +1034,16 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
 
     progress("How and when it went public")
     history = _safe("Older filing history", lambda: full_filing_history(sub, email, warnings), filings, warnings)
-    listing = _safe("Listing history", lambda: listing_history(history, cik, company),
-                    {"method": "Not determinable", "date": None, "first_edgar_filing": None,
-                     "exchange_registration": None, "evidence": []}, warnings)
-    listing["web"] = _safe("Web IPO summary", lambda: web_ipo_summary(company, tav_key, warnings), None, warnings)
+    listing = _safe("Listing history", lambda: listing_history(history, cik, company, sub),
+                    {"kind": "Unknown", "date": None, "summary": "", "link": "", "first_edgar_filing": None}, warnings)
+    if listing["kind"] == "Unknown":
+        web = _safe("Web IPO lookup", lambda: web_listing_fallback(company, tav_key, warnings), None, warnings)
+        if web:
+            listing.update(web)
+        else:
+            listing["summary"] = ("Public before electronic SEC filing (EDGAR) began; IPO date not found."
+                                  if (listing.get("first_edgar_filing") or "9999") <= "1997-12-31"
+                                  else "Route to listing could not be determined from public filings.")
 
     progress("Significant holders (Schedule 13D/13G)")
     holders, cusips = _safe("Significant holders", lambda: significant_holders(filings, cik, email), ([], set()), warnings)
@@ -802,14 +1055,20 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
     if ids["entity"].get("LEI"):
         company["lei"] = ids["entity"]["LEI"]
 
+    progress("Debt securities")
+    debt = _safe("Debt securities", lambda: debt_securities(filings, cik, email, ids, annual_raw, figi_key, warnings, used),
+                 {"bonds": [], "matured_excluded": 0, "documents_read": 0}, warnings)
+    debt["total_debt"] = bs.get("debt")
+
     progress("Market data")
-    if av_key:
-        used.add("Alpha Vantage")
-        market = _safe("Market data", lambda: market_data(company, securities, bs, av_key, warnings),
+    if av_key or td_key:
+        market = _safe("Market data", lambda: market_data(company, securities, bs, settings, warnings),
                        {"venues": [], "fx": {"USD": 1.0}}, warnings)
+        used.update(v["provider"] for v in market.get("venues", []))
     else:
         market = {"venues": [], "fx": {"USD": 1.0}}
-        warnings.append("Market data is off: add a free Alpha Vantage key (ALPHAVANTAGE_KEY) in the app settings.")
+        warnings.append("Market data is off: add a free Twelve Data key (TWELVEDATA_KEY) and/or Alpha Vantage key "
+                        "(ALPHAVANTAGE_KEY) in the app settings.")
         if bs.get("public_float"):
             market["public_float_usd"], market["public_float_date"] = bs["public_float"]["value"], bs["public_float"]["date"]
         if bs.get("shares_out"):
@@ -828,7 +1087,7 @@ def build_profile(cik, settings, sec_tickers, symdir, progress=lambda msg: None)
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "company": company, "cover": flags, "financials": bs, "market": market,
         "description": description, "filing_excerpt": filing_desc, "filing_excerpt_source": desc_src,
-        "listing": listing, "identifiers": ids,
+        "listing": listing, "identifiers": ids, "debt": debt,
         "securities": securities, "holders": holders, "events": events, "news": news[:25],
         "filings": filings, "warnings": warnings, "sources": sorted(used),
     }

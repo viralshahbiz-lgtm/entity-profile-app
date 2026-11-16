@@ -5,7 +5,8 @@ Run locally:   streamlit run app.py
 Settings (Streamlit "Secrets" or environment variables):
   SEC_CONTACT_EMAIL   required; the SEC asks for a contact email
   TAVILY_KEY          free key for web search (description summary, IPO summary, news)
-  ALPHAVANTAGE_KEY    free key for prices and volumes
+  TWELVEDATA_KEY      free key for prior-close prices on U.S. listings (800 calls a day)
+  ALPHAVANTAGE_KEY    free key for TSX prices and as a U.S. backup (25 calls a day)
   OPENFIGI_KEY        optional; raises OpenFIGI rate limits
 """
 import os
@@ -18,7 +19,7 @@ from entity_profile import build_profile
 from pdf_report import make_pdf
 
 st.set_page_config(page_title="Entity Profile", page_icon="📇", layout="wide")
-KEYS = ("SEC_CONTACT_EMAIL", "TAVILY_KEY", "ALPHAVANTAGE_KEY", "OPENFIGI_KEY")
+KEYS = ("SEC_CONTACT_EMAIL", "TAVILY_KEY", "TWELVEDATA_KEY", "ALPHAVANTAGE_KEY", "OPENFIGI_KEY")
 
 
 def setting(name):
@@ -95,7 +96,8 @@ all_listed = st.sidebar.toggle("Include every SEC-listed company", value=not len
 st.sidebar.divider()
 st.sidebar.caption(
     "Web search: " + ("on" if SETTINGS["TAVILY_KEY"] else "off (no Tavily key; news falls back to GDELT)") +
-    "  \nMarket data: " + ("on" if SETTINGS["ALPHAVANTAGE_KEY"] else "off (no Alpha Vantage key)") +
+    "  \nU.S. prices: " + ("Twelve Data" if SETTINGS["TWELVEDATA_KEY"] else ("Alpha Vantage" if SETTINGS["ALPHAVANTAGE_KEY"] else "off")) +
+    "  \nTSX prices: " + ("Alpha Vantage" if SETTINGS["ALPHAVANTAGE_KEY"] else "off (needs Alpha Vantage key)") +
     "  \nProfiles are cached for 6 hours to save free API calls.")
 
 # ---------------------------------------------------------------- type-ahead company search
@@ -162,9 +164,11 @@ if p["warnings"]:
 st.subheader("Market data")
 ccy = pv.get("currency", "")
 cols = st.columns(4)
-cols[0].metric("Price", money(pv.get("price"), ccy) if pv else "n/a",
-               f"{pv['change_1m_pct']:+.1f}% 1M" if pv.get("change_1m_pct") is not None else None,
-               help=f"{pv.get('exchange', '')} close {pv.get('price_date', '')}")
+cols[0].metric(f"Prior close{' (' + pv['price_date'] + ')' if pv.get('price_date') else ''}",
+               money(pv.get("price"), ccy) if pv else "n/a",
+               f"{pv['change_1d_pct']:+.2f}% on the day" if pv.get("change_1d_pct") is not None else None,
+               help=f"{pv.get('exchange', '')} close from {pv.get('provider', '')}. 1-month change: "
+                    + (f"{pv['change_1m_pct']:+.1f}%" if pv.get("change_1m_pct") is not None else "n/a"))
 cols[1].metric("Market cap", money(m.get("market_cap"), m.get("market_cap_ccy", "")))
 cols[2].metric("Enterprise value", money(m.get("enterprise_value"), ccy),
                help=f"Cash {money(m.get('cash'), ccy)}, debt {money(m.get('debt'), ccy)}" if m.get("enterprise_value") is not None else None)
@@ -175,6 +179,9 @@ cols[0].metric("Public float (reported)", money(m.get("public_float_usd"), "US$"
 cols[1].metric("Shares outstanding", f"{m['shares_out']:,.0f}" if m.get("shares_out") else "n/a")
 cols[2].metric("Avg daily volume (60d)", f"{m['adv_shares_total']:,.0f}" if m.get("adv_shares_total") else "n/a")
 cols[3].metric("ADTV worldwide (60d)", money(m.get("adtv_usd"), "US$"))
+if len(m.get("venues", [])) > 1:
+    st.caption("Other listings: " + " · ".join(f"{v['exchange']} prior close {money(v['price'], v['currency'])} ({v['price_date']})"
+                                               for v in m["venues"][1:]))
 
 # Business description
 st.subheader("Business description")
@@ -188,20 +195,10 @@ if p.get("filing_excerpt") and d["source"] != p.get("filing_excerpt_source"):
 
 # How and when it went public
 st.subheader("How and when it went public")
-a, b = st.columns([2, 3])
-with a:
-    st.markdown(f"**{lst['method']}**")
-    st.write(f"Date: **{lst['date'] or 'n/a'}**")
-    st.caption(f"First EDGAR filing: {lst['first_edgar_filing'] or 'n/a'} · Exchange registration (8-A): "
-               f"{lst['exchange_registration'] or 'n/a'}")
-    for form, dt, url in lst["evidence"]:
-        st.caption(f"[{form} filed {dt}]({url})")
-with b:
-    if lst.get("web"):
-        st.write(lst["web"]["text"])
-        st.caption("Web search summary · " + links_md(lst["web"]["links"]))
-    else:
-        st.caption("Add a Tavily key for a web summary of the IPO or listing.")
+if lst.get("summary"):
+    st.markdown(f"**{lst['summary']}**" + (f"  [source]({lst['link']})" if lst.get("link") else ""))
+else:
+    st.caption("Not available.")
 
 # Identifiers
 st.subheader("Security identifiers")
@@ -219,6 +216,24 @@ if ids["debt"]:
                      hide_index=True, use_container_width=True)
 for n in ids["notes"]:
     st.caption(n)
+
+# Debt securities
+dbt = p.get("debt") or {"bonds": []}
+st.subheader(f"Debt securities ({len(dbt['bonds'])} outstanding)")
+td = dbt.get("total_debt")
+st.caption((f"Total debt on the balance sheet: {money(td['value'], td['unit'])} as of {td['date']} (SEC XBRL). " if td else "")
+           + f"Searched {dbt.get('documents_read', 0)} recent offering documents, the issuer's GLEIF-mapped ISINs and the "
+             "annual report cover." + (f" {dbt['matured_excluded']} matured issues hidden." if dbt.get("matured_excluded") else ""))
+if dbt["bonds"]:
+    st.dataframe(pd.DataFrame([{"Security": b["description"], "Coupon": (b["coupon"] + "%") if b["coupon"] and b["coupon"] != "Floating" else b["coupon"],
+                                "Maturity": b["maturity"], "Amount": money(b["principal"], "US$") if b["principal"] else "",
+                                "CUSIP": b["cusip"], "ISIN": b["isin"], "FIGI": b["figi"], "Exchange-listed": b["listed"],
+                                "Source": ", ".join(b["sources"]), "Document": b["link"]} for b in dbt["bonds"]]),
+                 hide_index=True, use_container_width=True,
+                 column_config={"Document": st.column_config.LinkColumn(display_text="open")})
+    st.caption("Trade prices for corporate bonds are reported to FINRA TRACE; search by CUSIP at finra.org (Fixed Income Data).")
+else:
+    st.caption("No publicly issued notes or bonds found. Bank loans and private placements are not public securities.")
 
 # Holders
 st.subheader("Significant holders (5%+)")
@@ -248,7 +263,8 @@ with tab_ev:
 with tab_news:
     if p["news"]:
         for n in p["news"]:
-            st.markdown(f"**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
+            st.markdown(f"**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_  \n"
+                        f"<span style='font-size:0.8em;color:gray'>{n['url']}</span>", unsafe_allow_html=True)
     else:
         st.caption("No news found in the last 90 days.")
 

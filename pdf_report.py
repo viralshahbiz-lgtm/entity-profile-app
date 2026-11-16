@@ -42,6 +42,13 @@ def P(text, style="cell"):
     return Paragraph(escape(str(text if text is not None else "")), S[style])
 
 
+def L(text, url, style="cell"):
+    """Table cell whose text is a clickable link (when a URL is known)."""
+    if not url:
+        return P(text, style)
+    return Paragraph(f"<link href='{escape(url)}' color='#1f4fa8'>{escape(str(text))}</link>", S[style])
+
+
 def num(v, dec=2):
     if v is None:
         return "n/a"
@@ -69,8 +76,9 @@ def market_block(p):
     ccy = pv.get("currency", "")
     rng = (f"{num(pv.get('low_52w'))} – {num(pv.get('high_52w'))}" if pv.get("high_52w") else "n/a")
     cells = [
-        ("Price", f"{ccy} {num(pv.get('price'))}" if pv else "n/a", f"{pv.get('exchange', '')} {pv.get('price_date', '')}"),
-        ("1-month change", f"{pv['change_1m_pct']:+.1f}%" if pv.get("change_1m_pct") is not None else "n/a", ""),
+        ("Prior close", f"{ccy} {num(pv.get('price'))}" if pv else "n/a", f"{pv.get('exchange', '')} {pv.get('price_date', '')}"),
+        ("1-day / 1-month change", (f"{pv['change_1d_pct']:+.2f}%" if pv.get("change_1d_pct") is not None else "n/a") + " / " +
+         (f"{pv['change_1m_pct']:+.1f}%" if pv.get("change_1m_pct") is not None else "n/a"), pv.get("provider", "") if pv else ""),
         ("52-week range", rng, f"high wk {pv.get('high_52w_week', '')}" if pv else ""),
         ("Market cap", f"{m.get('market_cap_ccy', '')} {num(m.get('market_cap'))}" if m.get("market_cap") else "n/a",
          f"shares {num(m.get('shares_out'))} ({m.get('shares_out_date', '')})" if m.get("shares_out") else ""),
@@ -114,14 +122,11 @@ def build_story(p, lim):
                         (f" <font color='#5d6878'>[{escape(d['source'])}]</font>" if d["source"] else ""), S["body"])]
 
     # How and when it went public
-    ipo_txt = f"<b>{escape(lst['method'])}</b>" + (f" · <b>{escape(lst['date'])}</b>" if lst["date"] else "")
-    ev = "; ".join(f"{f} {dt}" for f, dt, _ in lst["evidence"][:4])
-    if ev:
-        ipo_txt += f" <font color='#5d6878'>(EDGAR: {escape(ev)})</font>"
-    story += [Paragraph("HOW AND WHEN IT WENT PUBLIC", S["h"]), Paragraph(ipo_txt, S["body"])]
-    if lst.get("web") and lim["ipo"]:
-        story.append(Paragraph(escape(_trim(lst["web"]["text"], lim["ipo"])) +
-                               " <font color='#5d6878'>[web search summary]</font>", S["body"]))
+    if lst.get("summary"):
+        story += [Paragraph("HOW AND WHEN IT WENT PUBLIC", S["h"]),
+                  Paragraph(f"<b>{escape(lst['summary'])}</b>" +
+                            (f" <link href='{escape(lst['link'])}' color='#1f4fa8'>source</link>" if lst.get("link") else ""),
+                            S["body"])]
 
     # Identifiers
     e = ids["entity"]
@@ -135,6 +140,18 @@ def build_story(p, lim):
         rows.append([P(x["ticker"]), P(x["exchange"]), P(x["type"]), P(x["isin"] or "n/a"), P(x["cusip"] or "n/a"),
                      P(x["composite_figi"] or "n/a")])
     story += [Spacer(1, 2), grid(rows, [0.8 * inch, 0.95 * inch, 1.35 * inch, 1.3 * inch, 1.05 * inch, W - 5.45 * inch])]
+
+    # Debt securities
+    dbt = p.get("debt") or {"bonds": []}
+    if dbt["bonds"]:
+        drows = [[P(h, "cellb") for h in ("Security", "Coupon", "Maturity", "Amount", "CUSIP", "Listed")]]
+        for b in dbt["bonds"][: lim["debt"]]:
+            drows.append([P(b["description"]), P(b["coupon"]), P(b["maturity"]),
+                          P(num(b["principal"], 0) if b["principal"] else ""), P(b["cusip"] or "n/a"), P(b["listed"])])
+        td = dbt.get("total_debt")
+        story += [Paragraph(f"DEBT SECURITIES ({min(len(dbt['bonds']), lim['debt'])} OF {len(dbt['bonds'])} OUTSTANDING"
+                            + (f"; TOTAL DEBT {escape(td['unit'])} {num(td['value'])} AS OF {escape(td['date'])}" if td else "") + ")", S["h"]),
+                  grid(drows, [W - 4.6 * inch, 0.6 * inch, 0.95 * inch, 0.75 * inch, 0.85 * inch, 1.45 * inch])]
 
     # Holders
     hold = p["holders"][: lim["holders"]]
@@ -151,8 +168,8 @@ def build_story(p, lim):
     rest = [x for x in evs if x["status"] != "Estimated"]
     show = (up[:2] + rest)[: lim["events"]]
     erows = [[P(h, "cellb") for h in ("Date", "Category", "Event", "Source")]] + \
-            [[P(x["date"]), P(x["category"]), P(_trim(x["title"], 140)), P(x["form"] if x["status"] != "Estimated" else "Estimated")]
-             for x in show]
+            [[P(x["date"]), P(x["category"]), L(_trim(x["title"], 140), x.get("url")),
+              P(x["form"] if x["status"] != "Estimated" else "Estimated")] for x in show]
     if len(erows) == 1:
         erows.append([P("No events found in the last 90 days.", "cellm"), "", "", ""])
     story += [KeepTogether([Paragraph(f"CORPORATE EVENTS (LAST 90 DAYS; {len(show)} OF {len(evs)})", S["h"]),
@@ -160,7 +177,7 @@ def build_story(p, lim):
     news = p["news"][: lim["news"]]
     if news:
         nrows = [[P("Date", "cellb"), P("Headline", "cellb"), P("Source", "cellb")]] + \
-                [[P(n["date"]), P(_trim(n["title"], 150)), P(n["source"])] for n in news]
+                [[P(n["date"]), L(_trim(n["title"], 150), n["url"]), P(n["source"])] for n in news]
         story += [KeepTogether([Paragraph(f"NEWS (LAST 90 DAYS; {len(news)} OF {len(p['news'])})", S["h"]),
                                 grid(nrows, [0.75 * inch, W - 2.05 * inch, 1.3 * inch])])]
 
@@ -200,11 +217,11 @@ def _footer(canvas, doc):
 
 
 def make_pdf(p):
-    limits = [dict(desc=900, ipo=500, ids=10, holders=6, events=14, news=10),
-              dict(desc=700, ipo=380, ids=8, holders=5, events=10, news=7),
-              dict(desc=550, ipo=280, ids=6, holders=4, events=8, news=5),
-              dict(desc=420, ipo=200, ids=5, holders=3, events=6, news=3),
-              dict(desc=300, ipo=0, ids=4, holders=3, events=4, news=0)]
+    limits = [dict(desc=900, ipo=500, ids=10, debt=10, holders=6, events=14, news=10),
+              dict(desc=700, ipo=380, ids=8, debt=8, holders=5, events=10, news=7),
+              dict(desc=550, ipo=280, ids=6, debt=6, holders=4, events=8, news=5),
+              dict(desc=420, ipo=200, ids=5, debt=5, holders=3, events=6, news=3),
+              dict(desc=300, ipo=0, ids=4, debt=4, holders=3, events=4, news=0)]
     pdf = None
     for lim in limits:
         buf = io.BytesIO()
