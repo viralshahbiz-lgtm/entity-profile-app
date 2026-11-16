@@ -17,6 +17,7 @@ import streamlit as st
 import sources as src
 from entity_profile import (build_base, ensure, section_data, to_profile, SECTIONS, USER_SECTIONS)
 from pdf_report import make_pdf
+from exports import securities_csv
 
 st.set_page_config(page_title="Entity Profile", page_icon="📇", layout="wide")
 KEYS = ("SEC_CONTACT_EMAIL", "TAVILY_KEY", "TWELVEDATA_KEY", "ALPHAVANTAGE_KEY", "OPENFIGI_KEY")
@@ -195,7 +196,7 @@ def range_bar(v):
 
 # ---------------------------------------------------------------- choose extra sections
 c = ctx["company"]
-head, btn = st.columns([4, 1])
+head, btn, btn2 = st.columns([3.2, 1, 1])
 with head:
     st.header(c["name"])
     commons = ", ".join(f"{x['ticker']} ({x['exchange']})" for x in ctx["securities"] if x["type"] == "Common Stock")
@@ -215,6 +216,19 @@ with btn:
                 load_section(ctx, name)
             status.update(label="PDF ready", state="complete")
         st.session_state["pdf_ready"] = ctx["cik"]
+        st.rerun()
+with btn2:
+    # Securities CSV: equity then fixed income, with every identifier
+    if {"identifiers", "debt"} <= ctx["loaded"]:
+        st.download_button("⬇ Securities CSV", data=securities_csv(to_profile(ctx)),
+                           file_name=f"{(commons.split(' ')[0] or c['cik'])}_securities.csv", mime="text/csv",
+                           use_container_width=True, help="Equity first, then fixed income, with ISIN, CUSIP, FIGIs and more")
+    elif st.button("🧾 Prepare securities CSV", use_container_width=True,
+                   help="Loads the equity identifiers and fixed income sections, then offers the CSV"):
+        with st.status("Loading securities and identifiers…") as status:
+            load_section(ctx, "identifiers")
+            load_section(ctx, "debt")
+            status.update(label="CSV ready", state="complete")
         st.rerun()
 
 st.markdown("**Add sections** (each loads only when ticked):")
@@ -317,35 +331,19 @@ if "holders" in picked:
         st.caption("No Schedule 13D/13G filings in the last three years.")
 
 if "news" in picked:
-    st.subheader("News and corporate events (last 90 days)")
-    mna = [n for n in p["news"] if n.get("mna")]
-    if mna:
-        with st.container(border=True):
-            st.markdown("#### 🔶 M&A and strategic transactions")
-            for n in mna:
-                tag = "🟠 **RUMORED** · " if n.get("rumored") else "🔴 **REPORTED** · "
-                st.markdown(f"{tag}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
+    st.subheader("M&A and strategic transactions (last 90 days)")
+    st.caption("Only stories about this company's mergers, acquisitions, sale processes, strategic reviews, divestitures, "
+               "joint ventures and deal rumors, plus SEC filings for actual transactions. General company news is left out.")
+    deals = sorted([{"date": n["date"], "status": "Rumored" if n.get("rumored") else "Reported", "title": n["title"],
+                     "source": n["source"], "url": n["url"]} for n in p["news"]] +
+                   [{"date": e["date"], "status": "Filed", "title": e["title"], "source": f"SEC {e['form']}", "url": e["url"]}
+                    for e in p["events"] if e["status"] == "Filed"], key=lambda x: x["date"], reverse=True)
+    if deals:
+        icon = {"Rumored": "🟠 **RUMORED**", "Reported": "🔴 **REPORTED**", "Filed": "📄 **SEC FILING**"}
+        for x in deals:
+            st.markdown(f"{icon[x['status']]} · **{x['date'] or 'undated'}** · [{x['title']}]({x['url']}) · _{x['source']}_")
     else:
-        st.caption("No M&A or strategic-transaction news found in the last 90 days.")
-    tab_news, tab_ev = st.tabs([f"All news ({len(p['news'])})", f"Corporate events ({len(p['events'])})"])
-    with tab_news:
-        for n in p["news"]:
-            badge = ("🟠 Rumored M&A · " if n.get("rumored") else "🔴 M&A · ") if n.get("mna") else ""
-            st.markdown(f"{badge}**{n['date'] or 'undated'}** · [{n['title']}]({n['url']}) · _{n['source']}_")
-        if not p["news"]:
-            st.caption("No news found in the last 90 days.")
-    with tab_ev:
-        if p["events"]:
-            cats = sorted({x["category"] for x in p["events"]})
-            chosen = st.multiselect("Category", cats, default=cats, key="evcats")
-            st.dataframe(pd.DataFrame([{"Date": x["date"], "Category": x["category"], "Event": x["title"],
-                                        "Status": x["status"], "Source": x["form"], "Link": x["url"]}
-                                       for x in p["events"] if x["category"] in chosen]),
-                         hide_index=True, use_container_width=True,
-                         column_config={"Link": st.column_config.LinkColumn(display_text="open")})
-            st.caption("M&A first. Filed = SEC filing · Reported / Rumored = web news · Estimated = worked out from filing history.")
-        else:
-            st.caption("No events found in the last 90 days.")
+        st.info("No M&A rumors or strategic transactions involving this company were found in the last 90 days.")
 
 if "regm" in picked:
     st.subheader("Research safe harbor summary")

@@ -185,28 +185,21 @@ def build_story(p, lim):
         hrows.append([P("No Schedule 13D/13G filings in 3 years", "cellm"), "", "", ""])
     story += [Paragraph(f"SIGNIFICANT HOLDERS (5%+; {len(hold)} OF {len(p['holders'])})", S["h"]),
               grid(hrows, [W - 2.6 * inch, 0.8 * inch, 0.9 * inch, 0.9 * inch])]
-    # 7. News (M&A and strategic first) and events
-    news = p["news"][: lim["news"]]
-    if news:
-        nrows = [[P("Date", "cellb"), P("Headline", "cellb"), P("Source", "cellb")]]
-        for n in news:
-            tag = ("<font color='#a5640b'><b>[RUMORED M&amp;A]</b></font> " if n.get("rumored") else
-                   "<font color='#b3261e'><b>[M&amp;A]</b></font> ") if n.get("mna") else ""
-            nrows.append([P(n["date"]), Paragraph(tag + f"<link href='{escape(n['url'])}' color='#1f4fa8'>"
-                                                        f"{escape(_trim(n['title'], 150))}</link>", S["cell"]), P(n["source"])])
-        n_mna = sum(1 for n in p["news"] if n.get("mna"))
-        story += [KeepTogether([Paragraph(f"NEWS, LAST 90 DAYS ({n_mna} M&amp;A / STRATEGIC FIRST; {len(news)} OF {len(p['news'])})", S["h"]),
-                                grid(nrows, [0.75 * inch, W - 2.05 * inch, 1.3 * inch])])]
-    evs = [x for x in p["events"] if x["status"] in ("Filed", "Estimated")]       # web items are already in News
-    up = sorted([x for x in evs if x["status"] == "Estimated"], key=lambda x: x["date"])
-    rest = [x for x in evs if x["status"] != "Estimated"]
-    show = (rest + up[:2])[: lim["events"]]
-    if show:
-        erows = [[P(h, "cellb") for h in ("Date", "Category", "Event (SEC filings)", "Form")]] + \
-                [[P(x["date"]), P(x["category"]), L(_trim(x["title"], 140), x.get("url")),
-                  P(x["form"] if x["status"] != "Estimated" else "Estimated")] for x in show]
-        story += [KeepTogether([Paragraph(f"CORPORATE EVENTS FROM SEC FILINGS ({len(show)} OF {len(evs)})", S["h"]),
-                                grid(erows, [0.75 * inch, 1.35 * inch, W - 3.3 * inch, 1.2 * inch])])]
+    # 7. M&A rumors and strategic transactions only
+    deals = sorted([{"date": n["date"], "status": "Rumored" if n.get("rumored") else "Reported", "title": n["title"],
+                     "source": n["source"], "url": n["url"]} for n in p["news"]] +
+                   [{"date": e["date"], "status": "Filed", "title": e["title"], "source": f"SEC {e['form']}", "url": e["url"]}
+                    for e in p["events"] if e["status"] == "Filed"], key=lambda x: x["date"], reverse=True)
+    shown = deals[: lim["news"]]
+    color = {"Rumored": "#a5640b", "Reported": "#b3261e", "Filed": "#1f4fa8"}
+    drows2 = [[P("Date", "cellb"), P("Status", "cellb"), P("Transaction / story", "cellb"), P("Source", "cellb")]]
+    for x in shown:
+        drows2.append([P(x["date"]), Paragraph(f"<font color='{color[x['status']]}'><b>{x['status'].upper()}</b></font>", S["cell"]),
+                       L(_trim(x["title"], 150), x["url"]), P(x["source"])])
+    if len(drows2) == 1:
+        drows2.append([P("No M&A rumors or strategic transactions found in the last 90 days.", "cellm"), "", "", ""])
+    story += [KeepTogether([Paragraph(f"M&amp;A AND STRATEGIC TRANSACTIONS, LAST 90 DAYS ({len(shown)} OF {len(deals)})", S["h"]),
+                            grid(drows2, [0.75 * inch, 0.75 * inch, W - 2.8 * inch, 1.3 * inch])])]
     # 8. Safe harbor summary
     block = [Paragraph("RESEARCH SAFE HARBOR SUMMARY", S["h"]), Paragraph(escape(r["summary"]), S["body"])]
     if r.get("harbors"):

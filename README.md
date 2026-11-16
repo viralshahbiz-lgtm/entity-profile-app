@@ -8,11 +8,13 @@ A simple web page. Start typing a company name or ticker, pick a match, and the 
 4. **Fixed income securities:** outstanding notes, bonds and convertibles with coupon, maturity, amount, CUSIP/ISIN and exchange listing, plus total debt.
 5. **How and when it went public:** one line, either the IPO date or that it merged with a SPAC / blank-check company.
 6. **Significant holders:** 5%+ holders from Schedule 13D and 13G filings.
-7. **News and corporate events, last 90 days:** M&A and strategic-transaction stories come first in a highlighted box, including rumored deals (marked RUMORED), then all other news. Every headline links to the article itself.
+7. **M&A and strategic transactions, last 90 days:** only stories about this company's mergers, acquisitions, sale processes, strategic reviews, divestitures, joint ventures and deal rumors (marked RUMORED or REPORTED), plus SEC filings for actual transactions (marked SEC FILING). General company news, stock tips and analyst ratings are left out. Every item links to the article or filing.
 8. **Research safe harbor summary:** Rule 139, JOBS Act EGC research and FINRA 2241 quiet periods.
 9. **Board of directors:** each director with a two-sentence biography from the latest proxy statement, other public company roles (from their own SEC ownership filings), and links to their SEC filings and a web profile search.
 
-There's also **Export PDF**, a one- to two-page summary in the same order with clickable links.
+Two exports:
+- **PDF:** a one- to two-page summary of every section, in the same order, with clickable links.
+- **Securities CSV:** every equity security first, then every fixed income security. Columns: Group, Security Name, Description, Security Type, Ticker, Exchange, Listing Country, ISIN, CUSIP, SEDOL, FIGI, Composite FIGI, Share Class FIGI, Coupon, Maturity, Amount Issued, Exchange Listing (Debt), Issuer Name, Issuer CIK, Issuer LEI, Source, Source Document, As Of. Opens directly in Excel.
 
 It runs free on **Streamlit Community Cloud**, a hosting service for small Python web apps. Setup takes about 30 minutes, all in a web browser.
 
@@ -119,7 +121,8 @@ It refreshes itself every Sunday.
 1. Click the search box at the top and **start typing** a company name or ticker. Matches appear as you type. Use the side panel to limit the list by sector or headquarters country.
 2. Pick a company. The page opens quickly with just the **company description** and **market data**.
 3. Tick any of the **Add sections** boxes to load more: equity securities and identifiers, fixed income, how it went public, significant holders, news and events, safe harbor summary, board of directors. Each section is fetched only when you tick it, and the results are reused for 6 hours.
-4. For the PDF, click **Prepare full PDF**. It loads every section (about 20 to 60 seconds the first time), then a **Download full PDF** button appears. The PDF always includes every section.
+4. For the securities list, click **Prepare securities CSV**. It loads the identifiers and fixed income sections, then **Securities CSV** downloads the file.
+5. For the PDF, click **Prepare full PDF**. It loads every section (about 20 to 60 seconds the first time), then a **Download full PDF** button appears. The PDF always includes every section.
 
 ---
 
@@ -179,6 +182,7 @@ This is a preliminary screen, not legal advice. Firm-side conditions (regular co
 | `entity_profile.py` | Gathers one company's data, including identifiers, listing history, events and news |
 | `regm.py` | Research safe harbor summary |
 | `pdf_report.py` | Builds the PDF summary |
+| `exports.py` | Builds the securities CSV (equity, then fixed income) |
 | `sources.py` | Connects to SEC, Tavily, GDELT, Wikipedia, GLEIF, OpenFIGI, Alpha Vantage and Nasdaq Trader |
 | `sectors.py` | Technology and Biotech industry codes; U.S. and Canada rules |
 | `build_universe.py` | Builds `data/universe.csv` (run weekly by GitHub) |

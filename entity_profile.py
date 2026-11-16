@@ -985,42 +985,64 @@ MNA_QUERY_TERMS = ("acquisition OR merger OR takeover OR buyout OR \"strategic a
                    "OR \"in talks\" OR bid OR divestiture OR \"joint venture\"")
 
 
+GENERIC_WORDS = {"applied", "advanced", "american", "general", "united", "international", "global", "first", "national",
+                 "digital", "data", "micro", "bio", "solar", "energy", "health", "systems", "technologies", "technology",
+                 "software", "therapeutics", "pharmaceuticals", "networks", "semiconductor", "new", "north", "south", "west",
+                 "east", "pacific", "atlantic", "the", "alpha", "beta", "next", "smart", "cloud", "life", "sciences", "medical"}
+NOT_DEAL_STORY = re.compile(r"\b(stocks? to (buy|watch|sell)|top \d+|\d+ best|best \w+ stocks|biggest movers|movers|"
+                            r"why .{0,40} (stock|shares) (is|are|was|were) (up|down|rising|falling|soaring|plunging)|"
+                            r"price target|upgrade[sd]?|downgrade[sd]?|etf|earnings preview|options activity|"
+                            r"short interest|technical analysis)\b", re.I)
+
+
+def mentions_company(text, company, ticker):
+    """True when a story is about this company: distinctive name words or the ticker appear in it."""
+    words = [w for w in src.clean_name(company["name"]).lower().split() if len(w) > 1]
+    t = (text or "").lower()
+    if words and " ".join(words) in t:
+        return True
+    distinctive = [w for w in words if w not in GENERIC_WORDS and len(w) >= 4]
+    if distinctive and re.search(rf"\b{re.escape(distinctive[0])}\b", t):
+        return True
+    return bool(ticker) and bool(re.search(rf"(\(|\b(nasdaq|nyse|tsx)\s*:\s*){re.escape(ticker.lower())}\b|\b{re.escape(ticker)}\b",
+                                           text or "", re.I if len(ticker) > 3 else 0))
+
+
 def web_news(company, ticker, tav_key, warnings, used, days=EVENT_DAYS):
-    """News from the last 90 days; M&A and strategic-transaction stories (including rumors) are fetched separately and listed first."""
+    """M&A rumors and strategic transactions about this company, last 90 days. Other news is left out."""
     cutoff = (date.today() - timedelta(days=days)).isoformat()
     items = []
     name = company["name"] + (f" ({ticker})" if ticker else "")
     if tav_key:
-        for q in (f"{name} acquisition, merger, takeover, sale process, strategic alternatives or deal talks",
-                  f"{name} news"):
-            try:
-                items += src.tavily(q, tav_key, topic="news", days=days, max_results=15, answer=False)["results"]
-                used.add("Tavily web search")
-            except src.DataError as e:
-                warnings.append(f"Web news: {e}")
-                break
+        try:
+            items = src.tavily(f"{name} acquisition, merger, takeover bid, sale process, strategic alternatives, "
+                               f"divestiture, joint venture or deal talks", tav_key, topic="news", days=days,
+                               max_results=20, answer=False)["results"]
+            used.add("Tavily web search")
+        except src.DataError as e:
+            warnings.append(f"Web news: {e}")
     if not items:
-        for extra in (f"({MNA_QUERY_TERMS.replace(chr(92), '')})", ""):
-            try:
-                items += src.gdelt_news(src.clean_name(company["name"]), max_records=50 if extra else 75, extra=extra)
-                used.add("GDELT news")
-            except src.DataError as e:
-                warnings.append(f"GDELT news: {e}")
+        try:
+            items = src.gdelt_news(src.clean_name(company["name"]), max_records=75,
+                                   extra=f"({MNA_QUERY_TERMS.replace(chr(92), '')})")
+            used.add("GDELT news")
+        except src.DataError as e:
+            warnings.append(f"GDELT news: {e}")
     out, seen = [], set()
     for it in items:
         d = _norm_date(it["date"])
         if d and d < cutoff:
             continue
+        text = f"{it['title']} {it.get('content', '')}"
         key = re.sub(r"\W+", " ", it["title"].lower())[:80]
-        if not it["title"] or key in seen or not is_article(it["url"], it["title"]):
+        if (not it["title"] or key in seen or not is_article(it["url"], it["title"])
+                or classify_news(it["title"], it.get("content", "")) != "M&A"      # must be a deal story
+                or NOT_DEAL_STORY.search(it["title"])                              # not a stock-tip or ratings piece
+                or not mentions_company(it["title"], company, ticker) and not mentions_company(text, company, ticker)):
             continue
         seen.add(key)
-        cat = classify_news(it["title"], it.get("content", ""))
-        rumored = cat == "M&A" and bool(RUMOR_RE.search(f"{it['title']} {it.get('content', '')}"))
-        out.append(dict(it, date=d or "", category=cat or "", mna=cat == "M&A", rumored=rumored))
-    # M&A / strategic first (newest first), then everything else (newest first)
-    out.sort(key=lambda x: x["date"], reverse=True)
-    return sorted(out, key=lambda x: not x["mna"])
+        out.append(dict(it, date=d or "", category="M&A", mna=True, rumored=bool(RUMOR_RE.search(text))))
+    return sorted(out, key=lambda x: x["date"], reverse=True)
 
 
 def _norm_date(s):
@@ -1142,7 +1164,7 @@ SECTIONS = {            # name -> (label, dependencies)
     "debt": ("Fixed income securities", ["identifiers", "annual"]),
     "listing": ("How and when it went public", []),
     "holders": ("Significant holders (5%+)", []),
-    "news": ("News and corporate events (last 90 days)", []),
+    "news": ("M&A and strategic transactions (last 90 days)", []),
     "regm": ("Research safe harbor summary", ["annual"]),
     "board": ("Board of directors", []),
     "annual": ("Annual report cover", []),          # internal helper section
@@ -1316,9 +1338,10 @@ def _sec_news(ctx):
     us_common = next((s for s in ctx["securities"] if s["country"] == "US" and s["type"] == "Common Stock"), None)
     news = _safe("News", lambda: web_news(ctx["company"], us_common["ticker"] if us_common else "", st.get("TAVILY_KEY", ""),
                                           w, ctx["used"]), [], w)
-    events = sorted(_safe("Corporate events", lambda: corporate_events(ctx["filings"], ctx["cik"]), [], w) +
-                    _safe("Web events", lambda: web_events(news), [], w), key=lambda e: e["date"], reverse=True)
-    events.sort(key=lambda e: e["category"] != "M&A")      # M&A and strategic transactions first
+    # SEC filings that evidence an actual transaction (merger agreements, completed deals, tender offers, merger proxies)
+    filed = [e for e in _safe("Corporate events", lambda: corporate_events(ctx["filings"], ctx["cik"]), [], w)
+             if e["category"] == "M&A" and e["status"] == "Filed"]
+    events = sorted(filed + _safe("Web events", lambda: web_events(news), [], w), key=lambda e: e["date"], reverse=True)
     return {"news": news[:25], "events": events}
 
 
